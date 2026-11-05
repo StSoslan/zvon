@@ -241,6 +241,11 @@ const en: Dictionary = {
     hintAccount: 'The picture is cropped to a square. Your avatar is stored in your account and shows on all your devices.'
   },
   settings: {
+    build: 'build {{build}}',
+    audioJournal: 'Audio log',
+    audioJournalHint: 'If call audio misbehaves, copy the log right after the problem and send it to whoever is fixing it.',
+    journalCopy: 'Copy log',
+    journalCopied: 'Copied',
     title: 'Settings',
     voice: 'Voice & video',
     notify: 'Notifications',

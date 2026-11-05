@@ -7,6 +7,7 @@ import { resolve } from 'node:path'
 import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import pkg from './package.json'
+import { buildId } from './build-id'
 
 /** Теги для телефонов и установки на главный экран — только в веб-версии. */
 const webHead: Plugin = {
@@ -36,7 +37,8 @@ export default defineConfig({
     __ZVON_EDITION__: JSON.stringify('online'),
     __ZVON_DEFAULT_SERVER__: JSON.stringify(''),
     __ZVON_WEB__: 'true',
-    __ZVON_VERSION__: JSON.stringify(pkg.version)
+    __ZVON_VERSION__: JSON.stringify(pkg.version),
+    __ZVON_BUILD__: JSON.stringify(buildId())
   },
   build: {
     outDir: resolve(__dirname, 'out/web'),

@@ -1,6 +1,7 @@
 import { resolve } from 'node:path'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
+import { buildId } from './build-id'
 
 const shared = { '@shared': resolve(__dirname, 'src/shared') }
 
@@ -43,7 +44,8 @@ export default defineConfig({
       __ZVON_EDITION__: JSON.stringify(edition),
       __ZVON_DEFAULT_SERVER__: JSON.stringify(defaultServer),
       __ZVON_WEB__: 'false',
-      __ZVON_VERSION__: JSON.stringify(process.env.npm_package_version ?? '')
+      __ZVON_VERSION__: JSON.stringify(process.env.npm_package_version ?? ''),
+      __ZVON_BUILD__: JSON.stringify(buildId())
     }
   }
 })

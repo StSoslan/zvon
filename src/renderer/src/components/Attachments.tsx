@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next'
 import type { FileInfo } from '../../../shared/types'
 import { fileUrl, formatDuration, formatSize } from '../lib/files'
 import { setApp, useApp } from '../store/app'
-import { notifyPageMedia } from '../store/voice'
+import { notifyPageMedia, notifyPageMediaPlaying } from '../store/voice'
 import { CloseIcon, DownloadIcon, FileIcon } from './Icons'
 
 const MAX_W = 400
@@ -65,16 +65,18 @@ const playingMedia = new WeakSet<HTMLMediaElement>()
 function mediaStarted(el: HTMLMediaElement): void {
   if (playingMedia.has(el)) return
   playingMedia.add(el)
-  notifyPageMedia(true)
+  notifyPageMedia(true, el)
 }
 
 function mediaStopped(el: HTMLMediaElement): void {
   if (!playingMedia.delete(el)) return
-  notifyPageMedia(false)
+  notifyPageMedia(false, el)
 }
 
 const callFriendlyMedia = {
   onPlay: (e: SyntheticEvent<HTMLMediaElement>) => mediaStarted(e.currentTarget),
+  // Звук реально пошёл: на iPhone в этот момент звонок возвращает себе голос собеседников поверх видео.
+  onPlaying: (e: SyntheticEvent<HTMLMediaElement>) => notifyPageMediaPlaying(e.currentTarget),
   onPause: (e: SyntheticEvent<HTMLMediaElement>) => mediaStopped(e.currentTarget),
   onEnded: (e: SyntheticEvent<HTMLMediaElement>) => mediaStopped(e.currentTarget),
   onEmptied: (e: SyntheticEvent<HTMLMediaElement>) => mediaStopped(e.currentTarget),

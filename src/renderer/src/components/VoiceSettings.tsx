@@ -6,6 +6,7 @@ import { useApp } from '../store/app'
 import { updateVoiceSettings } from '../store/voice'
 import { aiNoiseAvailable, type NoiseMode } from '../voice/settings'
 import { playSound } from '../voice/sounds'
+import { diagText, onDiag } from '../voice/diag'
 import { Modal } from './Common'
 import { IS_WEB } from '../edition'
 
@@ -421,10 +422,42 @@ function AppTab() {
       </label>
       {boot && (
         <p className="hint">
-          Zvon {boot.version}
+          Zvon {boot.version} · {t('settings.build', { build: __ZVON_BUILD__ })}
           {boot.profile ? ` · профиль «${boot.profile}»` : ''}
         </p>
       )}
+      <AudioJournal />
     </div>
+  )
+}
+
+/** Журнал звука: что происходило с микрофоном и звуком звонка. Его копируют и присылают, когда что-то не работает. */
+function AudioJournal() {
+  const { t } = useTranslation()
+  const [text, setText] = useState(diagText)
+  const [copied, setCopied] = useState(false)
+  useEffect(
+    () =>
+      onDiag(() => {
+        setText(diagText())
+        setCopied(false)
+      }),
+    []
+  )
+  const copy = (): void => {
+    navigator.clipboard.writeText(diagText()).then(
+      () => setCopied(true),
+      () => undefined
+    )
+  }
+  return (
+    <details className="diag">
+      <summary>{t('settings.audioJournal')}</summary>
+      <p className="hint">{t('settings.audioJournalHint')}</p>
+      <button className="btn btn-small btn-secondary" onClick={copy}>
+        {copied ? t('settings.journalCopied') : t('settings.journalCopy')}
+      </button>
+      <pre className="diag-log">{text}</pre>
+    </details>
   )
 }

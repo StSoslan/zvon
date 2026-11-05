@@ -8,6 +8,7 @@ import type { ConnStatus, ZvonClient } from '../net/client'
 import { MAX_VOLUME, VoiceEngine, type ScreenShareOptions } from '../voice/engine'
 import { saveVoiceSettings, type VoiceSettings } from '../voice/settings'
 import { playSound, resumeSounds, setSoundsOutput, type SoundName } from '../voice/sounds'
+import { diag, errText } from '../voice/diag'
 import { closeAllPopouts, setPopoutWant, syncPopouts } from '../lib/popout'
 import { getApp, setApp } from './app'
 
@@ -33,6 +34,7 @@ export function attachVoice(client: ZvonClient): void {
     (type, data) => client.request(type, data),
     {
       onStatus: (voiceStatus, voiceError) => {
+        if (voiceStatus !== getApp().voiceStatus) diag(`звонок: ${voiceStatus}${voiceError ? ` (${voiceError})` : ''}`)
         setCallAudioSession(voiceStatus === 'connecting' || voiceStatus === 'connected')
         setApp({ voiceStatus, voiceError })
       },
@@ -306,7 +308,9 @@ function domBinding(): Extract<PttBinding, { type: 'dom' }> | null {
  * Safari 16.4+: общий режим звука «запись и воспроизведение» на время звонка. Тогда видео из чата
  * играет вместе со звонком и не переключает телефон в режим «только воспроизведение», который глушит микрофон.
  */
-type AudioSessionNavigator = Navigator & { audioSession?: { type: string } }
+type AudioSessionNavigator = Navigator & {
+  audioSession?: { type: string; state?: string; addEventListener?: (type: 'statechange', listener: () => void) => void }
+}
 
 export function setCallAudioSession(inCall: boolean): void {
   const session = (navigator as AudioSessionNavigator).audioSession
@@ -323,24 +327,135 @@ const IS_IOS =
   typeof navigator !== 'undefined' &&
   (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1))
 
+/* ======================= звонок и видео из чата ======================= */
+
+/*
+ * Как это устроено на iPhone (Safari). В момент запуска видео со звуком Safari сам ставит на паузу
+ * остальной звук страницы — в том числе голоса собеседников. Но запретить он может только запуск видео
+ * «поверх», а не наоборот: звук звонка разрешено вернуть, пока видео играет. Поэтому:
+ *  1) как только видео пошло, возвращаем голоса собеседников — видео играет поверх звонка;
+ *  2) если Safari в ответ всё-таки остановил видео, больше так не делаем: звонок молчит, пока идёт видео,
+ *     и возвращается после него;
+ *  3) после видео и по любому нажатию на экран проверяем звонок и чиним его. Нажатие важно:
+ *     Safari надёжно запускает звук только в ответ на действие пользователя.
+ * На других устройствах звонок просто возобновляется после остановки видео.
+ */
+
+/** Safari не дал играть видео и звонку одновременно (см. выше, пункт 2). До перезагрузки страницы. */
+let overlayBlocked = false
+/** Видео, поверх которого мы только что вернули звук звонка, и когда. */
+let overlaidEl: HTMLMediaElement | null = null
+let overlaidAt = 0
+/** Последнее касание экрана: пауза сразу после него — это действие пользователя, а не Safari. */
+let lastGestureAt = 0
+/** После остановки видео первое же нажатие заново запускает звук звонка — даже если он выглядит исправным. */
+let recoverOnGesture = false
+
+let pageMediaCount = 0
+let recoverTimer: ReturnType<typeof setTimeout> | null = null
+
+/** Играет ли на странице видео или звук со звуком (кроме звонка) — например, видео из чата. */
+function pageMediaPlaying(): boolean {
+  for (const el of document.querySelectorAll<HTMLMediaElement>('video, audio')) {
+    if (!el.paused && !el.ended && !el.muted && el.volume > 0) return true
+  }
+  return false
+}
+
+/** Можно ли сейчас запускать звук звонка, не отнимая его у видео из чата. */
+function callMayPlay(): boolean {
+  return !pageMediaPlaying() || (IS_IOS && !overlayBlocked)
+}
+
+function resumeCallAudio(): void {
+  if (!engine || !callMayPlay()) return
+  engine.resumePlayback()
+  resumeSounds()
+}
+
+/** Видео или аудио из чата реально пошло (событие playing). На iPhone возвращаем звук звонка поверх него. */
+export function notifyPageMediaPlaying(el: HTMLMediaElement): void {
+  if (!IS_IOS || overlayBlocked || !engine?.inChannel) return
+  // Небольшая задержка: Safari ставит звонок на паузу в момент запуска видео.
+  setTimeout(() => {
+    if (!engine?.inChannel || el.paused || el.ended || overlayBlocked) return
+    diag(`видео играет — возвращаю звук звонка поверх него (на паузе: ${engine.playbackStalled ? 'да' : 'нет'})`)
+    overlaidEl = el
+    overlaidAt = Date.now()
+    engine.resumePlayback()
+    resumeSounds()
+  }, 250)
+}
+
+/**
+ * Видео или аудио из чата начало (play) или перестало играть (pause, ended, убрано со страницы).
+ * После остановки проверяем и чиним звук звонка.
+ */
+export function notifyPageMedia(playing: boolean, el?: HTMLMediaElement): void {
+  pageMediaCount = Math.max(0, pageMediaCount + (playing ? 1 : -1))
+  if (engine?.inChannel) diag(`${el?.tagName === 'AUDIO' ? 'аудио' : 'видео'} из чата: ${playing ? 'запуск' : 'остановка'}`)
+  if (recoverTimer) clearTimeout(recoverTimer)
+  recoverTimer = null
+  if (!engine) return
+
+  if (!playing && el && el === overlaidEl) {
+    const now = Date.now()
+    // Видео остановилось сразу после того, как мы вернули звук звонка, и человек экрана не касался —
+    // значит, его остановил Safari: вместе они у него не играют.
+    if (!el.ended && now - overlaidAt < 1200 && now - lastGestureAt > 700) {
+      overlayBlocked = true
+      diag('Safari остановил видео, когда вернулся звук звонка — на время видео звонок будет молчать')
+      engine.pausePlayback()
+      el.play().catch((err) => diag(`видео не возобновилось: ${errText(err)}`))
+      overlaidEl = null
+      return
+    }
+    overlaidEl = null
+  }
+  if (playing || pageMediaCount > 0) return
+
+  recoverTimer = setTimeout(() => {
+    recoverTimer = null
+    if (pageMediaCount > 0 || !engine?.inChannel) return
+    micRecoveries = 0
+    recoverOnGesture = IS_IOS
+    void engine.recoverAudio()
+    resumeSounds()
+  }, 400)
+}
+
+/**
+ * Нажатие на экран или клавишу. Если звонок молчит (звук на паузе, микрофон приглушён) или только что
+ * закончилось видео — чиним звонок прямо сейчас, пока Safari считает это действием пользователя.
+ */
+function onUserGesture(): void {
+  lastGestureAt = Date.now()
+  if (!engine?.inChannel || !callMayPlay()) return
+  if (!recoverOnGesture && !engine.playbackStalled && !engine.micInterrupted) return
+  recoverOnGesture = false
+  micRecoveries = 0
+  void engine.recoverAudio()
+  resumeSounds()
+}
+
 const MAX_MIC_RECOVERIES = 3
 let micRecoverTimer: ReturnType<typeof setTimeout> | null = null
 let micRecoveries = 0
 
 /**
  * iPhone приглушает микрофон, когда звук забирает что-то другое (видео, Siri, входящий звонок),
- * и часто сам его не возвращает — а вместе с микрофоном молчат и собеседники. Тогда переоткрываем
- * микрофон сами. Попыток подряд — не больше трёх, чтобы не дёргать микрофон, если его держит система.
+ * и часто сам его не возвращает. Тогда переоткрываем микрофон сами. Попыток подряд — не больше трёх,
+ * чтобы не дёргать микрофон, если его держит система; счётчик сбрасывают нажатие и возврат на страницу.
  */
 function scheduleMicRecovery(delayMs: number): void {
   if (!IS_IOS || micRecoverTimer) return
   micRecoverTimer = setTimeout(() => {
     micRecoverTimer = null
     if (!engine?.micInterrupted || micRecoveries >= MAX_MIC_RECOVERIES) return
-    // Видео ещё играет или страница скрыта — вернём звук, когда видео остановится или страницу откроют.
-    if (pageMediaPlaying() || document.visibilityState !== 'visible') return
+    // Страница скрыта или звук сейчас у видео — вернём микрофон, когда страницу откроют или видео остановится.
+    if (document.visibilityState !== 'visible' || !callMayPlay()) return
     micRecoveries++
-    void engine.recoverAudio(true)
+    void engine.recoverAudio()
   }, delayMs)
 }
 
@@ -354,44 +469,9 @@ function onMicInterrupted(interrupted: boolean): void {
   resumeCallAudio()
 }
 
-let pageMediaCount = 0
-let recoverTimer: ReturnType<typeof setTimeout> | null = null
-
 /**
- * Видео или аудио из чата начало или перестало играть. После остановки восстанавливаем звонок:
- * на iPhone система могла забрать у него звук и микрофон.
- */
-export function notifyPageMedia(playing: boolean): void {
-  pageMediaCount = Math.max(0, pageMediaCount + (playing ? 1 : -1))
-  if (recoverTimer) clearTimeout(recoverTimer)
-  recoverTimer = null
-  if (playing || pageMediaCount > 0 || !engine) return
-  recoverTimer = setTimeout(() => {
-    recoverTimer = null
-    micRecoveries = 0
-    // На iPhone переоткрываем микрофон всегда: это заново собирает звуковой тракт звонка, как перезаход в канал.
-    if (pageMediaCount === 0) void engine?.recoverAudio(IS_IOS)
-    resumeSounds()
-  }, 400)
-}
-
-/** Играет ли на странице видео или звук со звуком (кроме звонка) — например, видео из чата. */
-function pageMediaPlaying(): boolean {
-  for (const el of document.querySelectorAll<HTMLMediaElement>('video, audio')) {
-    if (!el.paused && !el.ended && !el.muted && el.volume > 0) return true
-  }
-  return false
-}
-
-function resumeCallAudio(): void {
-  if (!engine || pageMediaPlaying()) return
-  engine.resumePlayback()
-  resumeSounds()
-}
-
-/**
- * На телефонах видео из чата забирает звук у звонка, и браузер сам его не возвращает.
- * Возобновляем звонок, когда видео остановлено или закрыто, по касанию экрана и на всякий случай раз в 2 секунды.
+ * Следит, чтобы звонок не остался без звука: возобновляет его по нажатию, после остановки видео,
+ * при возврате звуковой сессии телефона и на всякий случай раз в 2 секунды.
  */
 function initPlaybackGuard(): void {
   const onMediaStop = (e: Event): void => {
@@ -399,14 +479,23 @@ function initPlaybackGuard(): void {
   }
   document.addEventListener('pause', onMediaStop, true)
   document.addEventListener('ended', onMediaStop, true)
-  // Браузер разрешает запуск звука только после действия пользователя — касание подходит.
-  document.addEventListener('pointerdown', () => {
-    if (engine?.playbackStalled) resumeCallAudio()
-  })
+  // touchend и click Safari считает действием пользователя (pointerdown — нет), поэтому слушаем все три.
+  for (const type of ['pointerdown', 'touchend', 'click', 'keydown'] as const) {
+    document.addEventListener(type, onUserGesture, { capture: true, passive: true })
+  }
   setInterval(() => {
     if (engine?.playbackStalled) resumeCallAudio()
     if (engine?.micInterrupted) scheduleMicRecovery(0)
   }, 2000)
+  // Телефон сообщает, когда звук у страницы отобрали (звонок, Siri) и когда вернули.
+  const session = (navigator as AudioSessionNavigator).audioSession
+  session?.addEventListener?.('statechange', () => {
+    diag(`звуковая сессия телефона: ${session.state ?? '?'}`)
+    if (session.state === 'active') {
+      resumeCallAudio()
+      if (engine?.micInterrupted) scheduleMicRecovery(500)
+    }
+  })
 }
 
 /** Один раз при запуске приложения: PTT из main-процесса и запасной вариант на клавишах окна. */
@@ -417,6 +506,7 @@ export async function initVoiceGlobal(): Promise<void> {
   // Свёрнутое или скрытое окно не смотрит видео — приём ставится на паузу.
   document.addEventListener('visibilitychange', () => {
     engine?.setPageVisible(document.visibilityState === 'visible')
+    if (engine?.inChannel) diag(`страница ${document.visibilityState === 'visible' ? 'снова открыта' : 'скрыта'}`)
     if (document.visibilityState === 'visible') {
       resumeCallAudio()
       // Вернулись в браузер (после звонка по телефону, другого приложения) — микрофон мог остаться приглушённым.

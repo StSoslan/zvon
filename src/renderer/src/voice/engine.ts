@@ -8,6 +8,7 @@ import { Device, types } from 'mediasoup-client'
 import { BITRATE } from '../../../shared/constants'
 import type { ConsumerInfo, MediaJson, MediaSource, ProducerInfo, RequestMap, RequestType, ResponseMap } from '../../../shared/types'
 import { createDenoisedTrack, type DenoisedTrack } from './denoise'
+import { diag, errText } from './diag'
 import { effectiveNoiseMode, SCREEN_PRESETS, type ScreenContent, type ScreenQuality, type VoiceSettings } from './settings'
 
 export type VoiceStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error'
@@ -381,16 +382,15 @@ export class VoiceEngine {
 
   /**
    * Открывает микрофон и, если выбрано усиленное шумоподавление, пропускает его через нейросеть.
-   * releaseFirst — сначала полностью отпустить старый микрофон: так система заново собирает
-   * звуковой тракт (нужно на iPhone после того, как звук забирало видео).
+   * Старый микрофон отпускается только после открытия нового: пока страница что-то записывает,
+   * Safari разрешает и новый запрос микрофона, и запуск звука без нажатия пользователя.
    */
-  private async openMic(releaseFirst = false): Promise<MediaStreamTrack> {
+  private async openMic(): Promise<MediaStreamTrack> {
     const allowed = await window.zvon.ensureMediaAccess('microphone')
     if (!allowed) throw Object.assign(new Error('Нет доступа к микрофону'), { name: 'NotAllowedError' })
     const ai = effectiveNoiseMode(this.settings()) === 'ai'
     // С нейросетью встроенное шумоподавление выключаем, чтобы звук не обрабатывался дважды.
     const constraints = this.audioConstraints(effectiveNoiseMode(this.settings()) === 'standard')
-    if (releaseFirst) this.stopMicStream()
     let stream: MediaStream
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: constraints, video: false })
@@ -408,10 +408,13 @@ export class VoiceEngine {
     const track = stream.getAudioTracks()[0]
     if (!track) throw new Error('Микрофон не выдал аудиодорожку')
     this.watchMic(track)
+    const info = track.getSettings()
+    diag(`микрофон открыт: ${info.sampleRate ?? '?'} Гц, шумоподавление «${effectiveNoiseMode(this.settings())}»`)
     if (!ai) return track
     try {
       const denoise = await createDenoisedTrack(track, {
         onFallback: (reason) => {
+          diag(`нейросеть шумоподавления отключилась: ${reason}`)
           if (this.denoise === denoise) this.hooks.onMicError(DENOISE_NOTICE[reason])
         }
       })
@@ -420,10 +423,12 @@ export class VoiceEngine {
       track.addEventListener('ended', () => {
         if (this.denoise === denoise) void this.restartMic()
       })
+      diag(denoise.engine === 'dfn' ? 'шумоподавление: нейросеть DeepFilterNet работает' : 'шумоподавление: нейросеть не загрузилась, упрощённый режим (RNNoise)')
       if (denoise.engine !== 'dfn') this.micNotice = DENOISE_NOTICE.load
       return denoise.track
     } catch (err) {
       console.warn('[voice] усиленное шумоподавление недоступно, используется встроенное', err)
+      diag(`шумоподавление: усиленное не запустилось (${errText(err)}), работает встроенное`)
       this.micNotice = `Усиленное шумоподавление не запустилось (${(err as Error).message}) — работает обычное`
       await track.applyConstraints(this.audioConstraints(true)).catch(() => undefined)
       return track
@@ -436,8 +441,13 @@ export class VoiceEngine {
   /** Система приглушила микрофон (track.muted): телефон отдал звук другому приложению или видео. */
   private watchMic(track: MediaStreamTrack): void {
     const report = (): void => {
-      if (this.micStream?.getAudioTracks()[0] === track) this.hooks.onMicInterrupted(track.muted)
+      if (this.micStream?.getAudioTracks()[0] !== track) return
+      diag(track.muted ? 'микрофон приглушён системой' : 'микрофон снова работает')
+      this.hooks.onMicInterrupted(track.muted)
     }
+    track.addEventListener('ended', () => {
+      if (this.micStream?.getAudioTracks()[0] === track) diag('микрофон остановлен системой')
+    })
     track.addEventListener('mute', report)
     track.addEventListener('unmute', report)
   }
@@ -487,6 +497,7 @@ export class VoiceEngine {
       this.micNotice = null
     } catch (err) {
       console.error('[voice] микрофон', err)
+      diag(`микрофон не открылся: ${errText(err)}`)
       this.hooks.onMicError(mediaErrorText(err, 'микрофон'))
     }
   }
@@ -494,28 +505,21 @@ export class VoiceEngine {
   /** Очередь переоткрытий: два одновременных открытия микрофона мешают друг другу. */
   private micQueue: Promise<void> = Promise.resolve()
 
-  /**
-   * Переоткрывает микрофон (смена устройства или обработки звука, восстановление после сбоя).
-   * releaseFirst — см. openMic.
-   */
-  restartMic(releaseFirst = false): Promise<void> {
-    this.micReleaseFirst ||= releaseFirst
+  /** Переоткрывает микрофон (смена устройства или обработки звука, восстановление после сбоя). */
+  restartMic(): Promise<void> {
     // Переоткрытие уже ждёт своей очереди — второе подряд не нужно.
     if (this.micRestartQueued) return this.micQueue
     this.micRestartQueued = true
     this.micQueue = this.micQueue.then(() => {
-      const release = this.micReleaseFirst
       this.micRestartQueued = false
-      this.micReleaseFirst = false
-      return this.doRestartMic(release)
+      return this.doRestartMic()
     })
     return this.micQueue
   }
 
   private micRestartQueued = false
-  private micReleaseFirst = false
 
-  private async doRestartMic(releaseFirst: boolean): Promise<void> {
+  private async doRestartMic(): Promise<void> {
     if (!this.inChannel || !this.ready) return
     const gen = this.gen
     if (!this.mic) {
@@ -523,7 +527,7 @@ export class VoiceEngine {
       return
     }
     try {
-      const track = await this.openMic(releaseFirst)
+      const track = await this.openMic()
       if (gen !== this.gen || !this.mic) {
         track.stop()
         return
@@ -533,6 +537,7 @@ export class VoiceEngine {
       this.hooks.onMicError(this.micNotice)
       this.micNotice = null
     } catch (err) {
+      diag(`микрофон не переоткрылся: ${errText(err)}`)
       if (gen === this.gen) this.hooks.onMicError(mediaErrorText(err, 'микрофон'))
     }
   }
@@ -854,7 +859,7 @@ export class VoiceEngine {
     el.srcObject = new MediaStream([consumer.track])
     const sink = this.settings().outputDeviceId
     if (sink && el.setSinkId) el.setSinkId(sink).catch((err) => console.warn('[voice] setSinkId', err))
-    el.play().catch((err) => console.warn('[voice] воспроизведение не началось', err))
+    this.play(el)
 
     const remote: RemoteAudio = { consumer, userId: info.userId, source: info.source, el, playing: false, boost: null }
     this.remotes.set(consumer.id, remote)
@@ -930,27 +935,44 @@ export class VoiceEngine {
    */
   resumePlayback(): void {
     for (const r of this.remotes.values()) {
-      if (r.el.paused) r.el.play().catch(() => undefined)
+      if (r.el.paused) this.play(r.el)
     }
     if (this.boostCtx && this.boostCtx.state !== 'running' && this.boostCtx.state !== 'closed') void this.boostCtx.resume().catch(() => undefined)
   }
 
   /**
-   * Полное восстановление звука после того, как его забрало видео (iPhone, Safari):
-   * пересоздаёт элементы воспроизведения, будит Web Audio и переоткрывает микрофон —
-   * то же, что делает перезаход в канал, но без него.
-   * reopenMic — переоткрыть микрофон в любом случае (иначе только если система его приглушила):
-   * на iPhone звук собеседников идёт через тот же тракт, что и микрофон, и оживает вместе с ним.
+   * Восстановление звука звонка без перезахода в канал: пересоздаёт элементы воспроизведения,
+   * будит Web Audio и переоткрывает микрофон, если система его приглушила или остановила
+   * (так делает iPhone, когда звук забирает видео, Siri или обычный звонок).
+   * Лучше всего срабатывает прямо в обработчике нажатия: Safari охотнее запускает звук по действию пользователя.
    */
-  async recoverAudio(reopenMic = false): Promise<void> {
+  async recoverAudio(): Promise<void> {
     if (!this.inChannel || !this.ready) return
     const gen = this.gen
+    diag(`восстанавливаю звук звонка (собеседников: ${this.remotes.size}, микрофон ${this.micInterrupted ? 'приглушён' : 'в порядке'})`)
     await this.rebuildPlayback()
-    if (!reopenMic && !this.micInterrupted) return
-    if (this.micInterrupted) console.warn('[voice] микрофон приглушён системой — переоткрываю')
-    await this.restartMic(true)
+    if (!this.micInterrupted) return
+    await this.restartMic()
     // При перезаходе звук собеседников подключается после микрофона — повторяем тот же порядок.
     if (gen === this.gen && this.ready) await this.rebuildPlayback()
+  }
+
+  /** Поставить звук собеседников на паузу (звонок уступает звук видео из чата). */
+  pausePlayback(): void {
+    for (const r of this.remotes.values()) {
+      try {
+        r.el.pause()
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  private play(el: HTMLAudioElement): void {
+    el.play().catch((err) => {
+      console.warn('[voice] воспроизведение не началось', err)
+      diag(`звук собеседника не запустился: ${errText(err)}`)
+    })
   }
 
   /** Пересоздаёт элементы воспроизведения собеседников и будит Web Audio. */
@@ -973,7 +995,7 @@ export class VoiceEngine {
       if (sink && el.setSinkId) el.setSinkId(sink).catch(() => undefined)
       r.el = el
       this.applyVolume(r)
-      el.play().catch(() => undefined)
+      this.play(el)
     }
     if (this.boostCtx && this.boostCtx.state !== 'running' && this.boostCtx.state !== 'closed') {
       await this.boostCtx.resume().catch(() => undefined)

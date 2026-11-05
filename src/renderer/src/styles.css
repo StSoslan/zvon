@@ -2784,3 +2784,30 @@ input[type='range'] {
 .tile-btn.off {
   color: var(--red);
 }
+
+/* Журнал звука в настройках */
+.diag {
+  margin-top: 6px;
+}
+
+.diag summary {
+  cursor: pointer;
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.diag-log {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  max-height: 260px;
+  overflow: auto;
+  background: var(--bg-0);
+  border-radius: var(--radius);
+  font: 11px/1.45 var(--mono);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
+}
