@@ -37,6 +37,7 @@ export function attachVoice(client: ZvonClient): void {
         setApp({ voiceStatus, voiceError })
       },
       onMicError: (micError) => setApp({ micError }),
+      onMicInterrupted,
       onFatalTransport: () => scheduleRejoin(500),
       onVideos: (remoteVideos) => {
         setApp({ remoteVideos })
@@ -264,9 +265,8 @@ export function updateVoiceSettings(patch: Partial<VoiceSettings>): void {
   const micChanged =
     prev.inputDeviceId !== next.inputDeviceId ||
     prev.echoCancellation !== next.echoCancellation ||
-    prev.noiseSuppression !== next.noiseSuppression ||
-    prev.autoGainControl !== next.autoGainControl ||
-    prev.rnnoise !== next.rnnoise
+    prev.noiseMode !== next.noiseMode ||
+    prev.autoGainControl !== next.autoGainControl
   if (micChanged) void engine?.restartMic()
   if (prev.outputDeviceId !== next.outputDeviceId) {
     void engine?.setOutputDevice(next.outputDeviceId)
@@ -318,6 +318,42 @@ export function setCallAudioSession(inCall: boolean): void {
   }
 }
 
+/** iPhone и iPad: любой браузер там работает на движке Safari и делит звук между звонком и видео по-своему. */
+const IS_IOS =
+  typeof navigator !== 'undefined' &&
+  (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1))
+
+const MAX_MIC_RECOVERIES = 3
+let micRecoverTimer: ReturnType<typeof setTimeout> | null = null
+let micRecoveries = 0
+
+/**
+ * iPhone приглушает микрофон, когда звук забирает что-то другое (видео, Siri, входящий звонок),
+ * и часто сам его не возвращает — а вместе с микрофоном молчат и собеседники. Тогда переоткрываем
+ * микрофон сами. Попыток подряд — не больше трёх, чтобы не дёргать микрофон, если его держит система.
+ */
+function scheduleMicRecovery(delayMs: number): void {
+  if (!IS_IOS || micRecoverTimer) return
+  micRecoverTimer = setTimeout(() => {
+    micRecoverTimer = null
+    if (!engine?.micInterrupted || micRecoveries >= MAX_MIC_RECOVERIES) return
+    // Видео ещё играет или страница скрыта — вернём звук, когда видео остановится или страницу откроют.
+    if (pageMediaPlaying() || document.visibilityState !== 'visible') return
+    micRecoveries++
+    void engine.recoverAudio(true)
+  }, delayMs)
+}
+
+function onMicInterrupted(interrupted: boolean): void {
+  if (interrupted) {
+    scheduleMicRecovery(1500)
+    return
+  }
+  micRecoveries = 0
+  // Микрофон вернулся — вместе с ним мог вернуться и звук собеседников.
+  resumeCallAudio()
+}
+
 let pageMediaCount = 0
 let recoverTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -332,7 +368,9 @@ export function notifyPageMedia(playing: boolean): void {
   if (playing || pageMediaCount > 0 || !engine) return
   recoverTimer = setTimeout(() => {
     recoverTimer = null
-    if (pageMediaCount === 0) void engine?.recoverAudio()
+    micRecoveries = 0
+    // На iPhone переоткрываем микрофон всегда: это заново собирает звуковой тракт звонка, как перезаход в канал.
+    if (pageMediaCount === 0) void engine?.recoverAudio(IS_IOS)
     resumeSounds()
   }, 400)
 }
@@ -367,6 +405,7 @@ function initPlaybackGuard(): void {
   })
   setInterval(() => {
     if (engine?.playbackStalled) resumeCallAudio()
+    if (engine?.micInterrupted) scheduleMicRecovery(0)
   }, 2000)
 }
 
@@ -378,7 +417,12 @@ export async function initVoiceGlobal(): Promise<void> {
   // Свёрнутое или скрытое окно не смотрит видео — приём ставится на паузу.
   document.addEventListener('visibilitychange', () => {
     engine?.setPageVisible(document.visibilityState === 'visible')
-    if (document.visibilityState === 'visible') resumeCallAudio()
+    if (document.visibilityState === 'visible') {
+      resumeCallAudio()
+      // Вернулись в браузер (после звонка по телефону, другого приложения) — микрофон мог остаться приглушённым.
+      micRecoveries = 0
+      if (engine?.micInterrupted) scheduleMicRecovery(300)
+    }
   })
   initPlaybackGuard()
   window.addEventListener('keydown', (e) => {

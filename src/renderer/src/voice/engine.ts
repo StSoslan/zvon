@@ -7,8 +7,8 @@
 import { Device, types } from 'mediasoup-client'
 import { BITRATE } from '../../../shared/constants'
 import type { ConsumerInfo, MediaJson, MediaSource, ProducerInfo, RequestMap, RequestType, ResponseMap } from '../../../shared/types'
-import { createDenoisedTrack, type DenoisedTrack } from './rnnoise'
-import { SCREEN_PRESETS, type ScreenContent, type ScreenQuality, type VoiceSettings } from './settings'
+import { createDenoisedTrack, type DenoisedTrack } from './denoise'
+import { effectiveNoiseMode, SCREEN_PRESETS, type ScreenContent, type ScreenQuality, type VoiceSettings } from './settings'
 
 export type VoiceStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error'
 
@@ -42,6 +42,8 @@ export interface EngineHooks {
   onStatus(status: VoiceStatus, error: string | null): void
   /** Проблема с микрофоном: в канале остаёмся, но без передачи голоса. */
   onMicError(message: string | null): void
+  /** Система приглушила микрофон (true) или вернула его (false) — например, телефон отдал звук видео. */
+  onMicInterrupted(interrupted: boolean): void
   /** Транспорт не восстановился — нужен полный перезаход в канал. */
   onFatalTransport(): void
   onVideos(videos: RemoteVideoView[]): void
@@ -86,6 +88,13 @@ interface RemoteVideo {
 }
 
 type SinkableAudio = HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> }
+
+/** Предупреждения об усиленном шумоподавлении, когда нейросеть не работает. */
+const DENOISE_NOTICE = {
+  load: 'Нейросеть шумоподавления не загрузилась — работает упрощённый режим',
+  error: 'Нейросеть шумоподавления дала сбой — работает упрощённый режим',
+  overload: 'Процессор не успевает за нейросетью шумоподавления — включён упрощённый режим'
+} as const
 
 const ICE_RESTART_DELAY_MS = 2_000
 const MAX_ICE_RESTARTS = 3
@@ -357,30 +366,39 @@ export class VoiceEngine {
 
   /* ======================= микрофон ======================= */
 
-  private audioConstraints(): MediaTrackConstraints {
+  /** builtinNoise — включить встроенное в браузер шумоподавление. */
+  private audioConstraints(builtinNoise: boolean): MediaTrackConstraints {
     const s = this.settings()
     return {
       deviceId: s.inputDeviceId ? { exact: s.inputDeviceId } : undefined,
       echoCancellation: s.echoCancellation,
-      // С RNNoise встроенное шумоподавление выключаем, чтобы звук не обрабатывался дважды.
-      noiseSuppression: s.rnnoise ? false : s.noiseSuppression,
+      noiseSuppression: builtinNoise,
       autoGainControl: s.autoGainControl,
       channelCount: 1,
       sampleRate: 48000
     }
   }
 
-  private async openMic(): Promise<MediaStreamTrack> {
+  /**
+   * Открывает микрофон и, если выбрано усиленное шумоподавление, пропускает его через нейросеть.
+   * releaseFirst — сначала полностью отпустить старый микрофон: так система заново собирает
+   * звуковой тракт (нужно на iPhone после того, как звук забирало видео).
+   */
+  private async openMic(releaseFirst = false): Promise<MediaStreamTrack> {
     const allowed = await window.zvon.ensureMediaAccess('microphone')
     if (!allowed) throw Object.assign(new Error('Нет доступа к микрофону'), { name: 'NotAllowedError' })
+    const ai = effectiveNoiseMode(this.settings()) === 'ai'
+    // С нейросетью встроенное шумоподавление выключаем, чтобы звук не обрабатывался дважды.
+    const constraints = this.audioConstraints(effectiveNoiseMode(this.settings()) === 'standard')
+    if (releaseFirst) this.stopMicStream()
     let stream: MediaStream
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: this.audioConstraints(), video: false })
+      stream = await navigator.mediaDevices.getUserMedia({ audio: constraints, video: false })
     } catch (err) {
       // Выбранное устройство пропало — пробуем микрофон по умолчанию.
       const name = (err as DOMException).name
       if ((name === 'OverconstrainedError' || name === 'NotFoundError') && this.settings().inputDeviceId) {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: { ...this.audioConstraints(), deviceId: undefined }, video: false })
+        stream = await navigator.mediaDevices.getUserMedia({ audio: { ...constraints, deviceId: undefined }, video: false })
       } else {
         throw err
       }
@@ -389,20 +407,45 @@ export class VoiceEngine {
     this.micStream = stream
     const track = stream.getAudioTracks()[0]
     if (!track) throw new Error('Микрофон не выдал аудиодорожку')
-    if (!this.settings().rnnoise) return track
+    this.watchMic(track)
+    if (!ai) return track
     try {
-      this.denoise = await createDenoisedTrack(track)
-      return this.denoise.track
+      const denoise = await createDenoisedTrack(track, {
+        onFallback: (reason) => {
+          if (this.denoise === denoise) this.hooks.onMicError(DENOISE_NOTICE[reason])
+        }
+      })
+      this.denoise = denoise
+      // Обработанная дорожка сама не узнаёт, что микрофон отключили, — следим за исходной.
+      track.addEventListener('ended', () => {
+        if (this.denoise === denoise) void this.restartMic()
+      })
+      if (denoise.engine !== 'dfn') this.micNotice = DENOISE_NOTICE.load
+      return denoise.track
     } catch (err) {
-      console.warn('[voice] RNNoise недоступен, используется встроенное шумоподавление', err)
-      this.rnnoiseWarning = `RNNoise недоступен (${(err as Error).message}) — работает встроенное шумоподавление`
-      // Без RNNoise возвращаем встроенное шумоподавление WebRTC.
-      await track.applyConstraints({ ...this.audioConstraints(), noiseSuppression: this.settings().noiseSuppression }).catch(() => undefined)
+      console.warn('[voice] усиленное шумоподавление недоступно, используется встроенное', err)
+      this.micNotice = `Усиленное шумоподавление не запустилось (${(err as Error).message}) — работает обычное`
+      await track.applyConstraints(this.audioConstraints(true)).catch(() => undefined)
       return track
     }
   }
 
-  private rnnoiseWarning: string | null = null
+  /** Предупреждение, которое покажется после успешного запуска микрофона. */
+  private micNotice: string | null = null
+
+  /** Система приглушила микрофон (track.muted): телефон отдал звук другому приложению или видео. */
+  private watchMic(track: MediaStreamTrack): void {
+    const report = (): void => {
+      if (this.micStream?.getAudioTracks()[0] === track) this.hooks.onMicInterrupted(track.muted)
+    }
+    track.addEventListener('mute', report)
+    track.addEventListener('unmute', report)
+  }
+
+  /** Микрофон открыт, но система его приглушила или остановила. */
+  get micInterrupted(): boolean {
+    return this.micStream?.getAudioTracks().some((t) => t.readyState === 'ended' || t.muted) ?? false
+  }
 
   private stopMicStream(): void {
     this.denoise?.stop()
@@ -440,16 +483,39 @@ export class VoiceEngine {
         console.warn('[voice] микрофон отключён, пробую переоткрыть')
         void this.restartMic()
       })
-      this.hooks.onMicError(this.rnnoiseWarning)
-      this.rnnoiseWarning = null
+      this.hooks.onMicError(this.micNotice)
+      this.micNotice = null
     } catch (err) {
       console.error('[voice] микрофон', err)
       this.hooks.onMicError(mediaErrorText(err, 'микрофон'))
     }
   }
 
-  /** Переоткрывает микрофон (смена устройства или обработки звука). */
-  async restartMic(): Promise<void> {
+  /** Очередь переоткрытий: два одновременных открытия микрофона мешают друг другу. */
+  private micQueue: Promise<void> = Promise.resolve()
+
+  /**
+   * Переоткрывает микрофон (смена устройства или обработки звука, восстановление после сбоя).
+   * releaseFirst — см. openMic.
+   */
+  restartMic(releaseFirst = false): Promise<void> {
+    this.micReleaseFirst ||= releaseFirst
+    // Переоткрытие уже ждёт своей очереди — второе подряд не нужно.
+    if (this.micRestartQueued) return this.micQueue
+    this.micRestartQueued = true
+    this.micQueue = this.micQueue.then(() => {
+      const release = this.micReleaseFirst
+      this.micRestartQueued = false
+      this.micReleaseFirst = false
+      return this.doRestartMic(release)
+    })
+    return this.micQueue
+  }
+
+  private micRestartQueued = false
+  private micReleaseFirst = false
+
+  private async doRestartMic(releaseFirst: boolean): Promise<void> {
     if (!this.inChannel || !this.ready) return
     const gen = this.gen
     if (!this.mic) {
@@ -457,17 +523,17 @@ export class VoiceEngine {
       return
     }
     try {
-      const track = await this.openMic()
+      const track = await this.openMic(releaseFirst)
       if (gen !== this.gen || !this.mic) {
         track.stop()
         return
       }
       track.enabled = this.shouldTransmit()
       await this.mic.replaceTrack({ track })
-      this.hooks.onMicError(this.rnnoiseWarning)
-      this.rnnoiseWarning = null
+      this.hooks.onMicError(this.micNotice)
+      this.micNotice = null
     } catch (err) {
-      this.hooks.onMicError(mediaErrorText(err, 'микрофон'))
+      if (gen === this.gen) this.hooks.onMicError(mediaErrorText(err, 'микрофон'))
     }
   }
 
@@ -871,11 +937,24 @@ export class VoiceEngine {
 
   /**
    * Полное восстановление звука после того, как его забрало видео (iPhone, Safari):
-   * пересоздаёт элементы воспроизведения, будит Web Audio и переоткрывает микрофон,
-   * если система его приглушила или остановила. Без перезахода в канал.
+   * пересоздаёт элементы воспроизведения, будит Web Audio и переоткрывает микрофон —
+   * то же, что делает перезаход в канал, но без него.
+   * reopenMic — переоткрыть микрофон в любом случае (иначе только если система его приглушила):
+   * на iPhone звук собеседников идёт через тот же тракт, что и микрофон, и оживает вместе с ним.
    */
-  async recoverAudio(): Promise<void> {
+  async recoverAudio(reopenMic = false): Promise<void> {
     if (!this.inChannel || !this.ready) return
+    const gen = this.gen
+    await this.rebuildPlayback()
+    if (!reopenMic && !this.micInterrupted) return
+    if (this.micInterrupted) console.warn('[voice] микрофон приглушён системой — переоткрываю')
+    await this.restartMic(true)
+    // При перезаходе звук собеседников подключается после микрофона — повторяем тот же порядок.
+    if (gen === this.gen && this.ready) await this.rebuildPlayback()
+  }
+
+  /** Пересоздаёт элементы воспроизведения собеседников и будит Web Audio. */
+  private async rebuildPlayback(): Promise<void> {
     for (const r of this.remotes.values()) {
       if (r.consumer.closed) continue
       this.dropBoost(r)
@@ -898,11 +977,6 @@ export class VoiceEngine {
     }
     if (this.boostCtx && this.boostCtx.state !== 'running' && this.boostCtx.state !== 'closed') {
       await this.boostCtx.resume().catch(() => undefined)
-    }
-    const micDead = this.micStream?.getAudioTracks().some((t) => t.readyState === 'ended' || t.muted) ?? false
-    if (micDead) {
-      console.warn('[voice] микрофон приглушён системой после видео — переоткрываю')
-      await this.restartMic()
     }
   }
 

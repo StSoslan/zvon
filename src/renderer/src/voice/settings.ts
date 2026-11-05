@@ -1,8 +1,14 @@
 /** Локальные настройки голоса (хранятся в localStorage этого профиля). */
 import type { PttBinding } from '../../../preload/api'
+import { denoiseSupported } from './denoise'
 
 export type VoiceMode = 'voice' | 'ptt'
 export type NotifyMode = 'all' | 'mentions' | 'none'
+/**
+ * Шумоподавление микрофона: ai — нейросеть DeepFilterNet3 и речевой шлюз (убирает клавиатуру, щелчки, фон);
+ * standard — встроенное в браузер; off — выключено.
+ */
+export type NoiseMode = 'ai' | 'standard' | 'off'
 
 export type ScreenQuality = '720p30' | '720p60' | '1080p30' | '1080p60' | '1440p30' | '1440p60'
 /** detail — текст и код (чёткость важнее плавности); motion — игры и видео. */
@@ -29,7 +35,7 @@ export interface VoiceSettings {
   inputDeviceId: string
   outputDeviceId: string
   echoCancellation: boolean
-  noiseSuppression: boolean
+  noiseMode: NoiseMode
   autoGainControl: boolean
   mode: VoiceMode
   pttBinding: PttBinding | null
@@ -44,8 +50,6 @@ export interface VoiceSettings {
   screenQuality: ScreenQuality
   screenContent: ScreenContent
   screenAudio: boolean
-  /** Шумоподавление RNNoise (нейросеть) вместо встроенного в WebRTC. */
-  rnnoise: boolean
   /** Уведомления ОС о сообщениях: все, только упоминания, никаких. */
   notifyMode: NotifyMode
   notifySound: boolean
@@ -59,7 +63,7 @@ export const DEFAULT_VOICE_SETTINGS: VoiceSettings = {
   inputDeviceId: '',
   outputDeviceId: '',
   echoCancellation: true,
-  noiseSuppression: true,
+  noiseMode: 'ai',
   autoGainControl: true,
   mode: 'voice',
   pttBinding: null,
@@ -71,20 +75,56 @@ export const DEFAULT_VOICE_SETTINGS: VoiceSettings = {
   screenQuality: '1080p30',
   screenContent: 'detail',
   screenAudio: false,
-  rnnoise: false,
   notifyMode: 'mentions',
   notifySound: true,
   notifyPreview: true
 }
 
+function isMobile(): boolean {
+  if (typeof navigator === 'undefined') return false
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+}
+
+/** Усиленное шумоподавление доступно в приложении и в Chrome/Edge на компьютере. */
+export function aiNoiseAvailable(): boolean {
+  return denoiseSupported()
+}
+
+/**
+ * Режим по умолчанию: на компьютере — усиленное; на телефоне — встроенное (у телефонов оно своё и хорошее,
+ * а нейросеть заметно расходует батарею).
+ */
+function defaultNoiseMode(): NoiseMode {
+  return aiNoiseAvailable() && !isMobile() ? 'ai' : 'standard'
+}
+
+/** Режим, который реально сработает на этом устройстве. */
+export function effectiveNoiseMode(s: VoiceSettings): NoiseMode {
+  return s.noiseMode === 'ai' && !aiNoiseAvailable() ? 'standard' : s.noiseMode
+}
+
+/** Старые настройки: два флажка (встроенное шумоподавление и RNNoise) вместо режима. */
+interface LegacySettings {
+  noiseSuppression?: boolean
+  rnnoise?: boolean
+}
+
+function noiseModeFrom(parsed: Partial<VoiceSettings> & LegacySettings): NoiseMode {
+  if (parsed.noiseMode === 'ai' || parsed.noiseMode === 'standard' || parsed.noiseMode === 'off') return parsed.noiseMode
+  // Раньше шумоподавление выключали явно — уважаем этот выбор; остальным включаем лучшее из доступного.
+  if (parsed.noiseSuppression === false && !parsed.rnnoise) return 'off'
+  return defaultNoiseMode()
+}
+
 export function loadVoiceSettings(): VoiceSettings {
   try {
     const raw = localStorage.getItem(KEY)
-    if (!raw) return { ...DEFAULT_VOICE_SETTINGS }
-    const parsed = JSON.parse(raw) as Partial<VoiceSettings>
+    if (!raw) return { ...DEFAULT_VOICE_SETTINGS, noiseMode: defaultNoiseMode() }
+    const { noiseSuppression, rnnoise, ...parsed } = JSON.parse(raw) as Partial<VoiceSettings> & LegacySettings
     return {
       ...DEFAULT_VOICE_SETTINGS,
       ...parsed,
+      noiseMode: noiseModeFrom({ ...parsed, noiseSuppression, rnnoise }),
       userVolumes: { ...(parsed.userVolumes ?? {}) },
       streamVolumes: { ...(parsed.streamVolumes ?? {}) },
       mode: parsed.mode === 'ptt' ? 'ptt' : 'voice',
@@ -93,7 +133,7 @@ export function loadVoiceSettings(): VoiceSettings {
       notifyMode: parsed.notifyMode === 'all' || parsed.notifyMode === 'none' ? parsed.notifyMode : 'mentions'
     }
   } catch {
-    return { ...DEFAULT_VOICE_SETTINGS }
+    return { ...DEFAULT_VOICE_SETTINGS, noiseMode: defaultNoiseMode() }
   }
 }
 

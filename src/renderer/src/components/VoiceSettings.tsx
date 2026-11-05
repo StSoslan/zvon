@@ -4,7 +4,7 @@ import type { AppSettings, PttBinding } from '../../../preload/api'
 import { LANGUAGES, setLanguage, type Language } from '../i18n'
 import { useApp } from '../store/app'
 import { updateVoiceSettings } from '../store/voice'
-import { rnnoiseSupported } from '../voice/rnnoise'
+import { aiNoiseAvailable, type NoiseMode } from '../voice/settings'
 import { playSound } from '../voice/sounds'
 import { Modal } from './Common'
 import { IS_WEB } from '../edition'
@@ -61,7 +61,7 @@ function MicMeter({ onPermission }: { onPermission: () => void }) {
           audio: {
             deviceId: settings.inputDeviceId ? { exact: settings.inputDeviceId } : undefined,
             echoCancellation: settings.echoCancellation,
-            noiseSuppression: settings.noiseSuppression,
+            noiseSuppression: settings.noiseMode !== 'off',
             autoGainControl: settings.autoGainControl
           }
         })
@@ -97,7 +97,7 @@ function MicMeter({ onPermission }: { onPermission: () => void }) {
       stream?.getTracks().forEach((tr) => tr.stop())
       void ctx?.close()
     }
-  }, [settings.inputDeviceId, settings.echoCancellation, settings.noiseSuppression, settings.autoGainControl, onPermission])
+  }, [settings.inputDeviceId, settings.echoCancellation, settings.noiseMode, settings.autoGainControl, onPermission])
 
   return (
     <div className="mic-meter">
@@ -231,24 +231,19 @@ function VoiceTab() {
           />
           {t('voice.echo')}
         </label>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={settings.noiseSuppression}
-            onChange={(e) => updateVoiceSettings({ noiseSuppression: e.target.checked })}
-          />
-          {t('voice.noise')}
+        <label className="field">
+          <span className="field-label">{t('voice.noise')}</span>
+          <select value={settings.noiseMode} onChange={(e) => updateVoiceSettings({ noiseMode: e.target.value as NoiseMode })}>
+            <option value="ai" disabled={!aiNoiseAvailable()}>
+              {t('voice.noiseAi')}
+            </option>
+            <option value="standard">{t('voice.noiseStandard')}</option>
+            <option value="off">{t('voice.noiseOff')}</option>
+          </select>
         </label>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={settings.rnnoise}
-            disabled={!rnnoiseSupported()}
-            onChange={(e) => updateVoiceSettings({ rnnoise: e.target.checked })}
-          />
-          {t('voice.rnnoise')}
-        </label>
-        {settings.rnnoise && <p className="hint">{t('voice.rnnoiseHint')}</p>}
+        <p className="hint">
+          {!aiNoiseAvailable() ? t('voice.noiseAiUnavailable') : settings.noiseMode === 'ai' ? t('voice.noiseAiHint') : t('voice.noiseStandardHint')}
+        </p>
         <label className="checkbox">
           <input
             type="checkbox"

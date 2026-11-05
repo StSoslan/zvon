@@ -24,7 +24,7 @@
   - выключение микрофона и звука;
   - громкость каждого участника;
   - выбор микрофона и динамиков;
-  - эхо- и шумоподавление, в том числе нейросетевое (RNNoise);
+  - эхоподавление и усиленное шумоподавление нейросетью (DeepFilterNet3): убирает стук клавиатуры, щелчки и фон даже поверх речи;
   - push-to-talk с глобальной клавишей.
 - **Демонстрация экрана**:
   - выбор экрана или окна с превью;
@@ -371,3 +371,5 @@ electron-builder.yml          упаковка
 ## Лицензия
 
 MIT — см. `LICENSE`.
+
+Шумоподавление использует [DeepFilterNet3](https://github.com/Rikorose/DeepFilterNet) (MIT / Apache-2.0) и [RNNoise](https://github.com/jitsi/rnnoise-wasm) — подробности в `src/renderer/src/voice/denoise/dfn/NOTICE.md`.
