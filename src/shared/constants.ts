@@ -1,5 +1,5 @@
 /** Версия протокола WebSocket. Клиент и сервер с разными версиями не соединяются. */
-export const PROTOCOL_VERSION = 5
+export const PROTOCOL_VERSION = 6
 
 export const APP_NAME = 'Zvon'
 
@@ -28,6 +28,15 @@ export const LIMITS = {
   historyPage: 50,
   historyPageMax: 100,
   attachmentsPerMessage: 10,
+  /** Текст статуса участника («отошёл, буду в 17:30»). */
+  statusLength: 80,
+  statusPresets: 20,
+  roleNameLength: 32,
+  rolesMax: 30,
+  searchQueryLength: 100,
+  searchPage: 30,
+  /** Сколько сообщений показывать в цитате ответа (символов). */
+  replySnippetLength: 160,
   fileNameLength: 200,
   /** Лимит размера файла по умолчанию, МБ (меняется хостом). */
   defaultMaxUploadMb: 500,

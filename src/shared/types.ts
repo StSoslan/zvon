@@ -1,11 +1,24 @@
 import type { ErrorCode } from './constants'
 
-export type ChannelType = 'text' | 'voice'
+/** dm — личная переписка двух участников (у каждого свой список таких каналов). */
+export type ChannelType = 'text' | 'voice' | 'dm'
 
 export interface Channel {
   id: string
+  /** У личного канала пустое: клиент показывает имя собеседника. */
   name: string
   type: ChannelType
+  position: number
+  /** Участники личного канала (два id); у остальных каналов отсутствует. */
+  members?: string[]
+}
+
+/** Роль участника — метка с цветом, которую выдаёт администратор (прав не даёт). */
+export interface Role {
+  id: string
+  name: string
+  /** Цвет в формате #rrggbb. */
+  color: string
   position: number
 }
 
@@ -16,6 +29,10 @@ export interface UserInfo {
   avatar: string | null
   online: boolean
   isAdmin: boolean
+  /** Статус, который участник выбрал или вписал сам («отошёл, буду в 17:30»); null — без статуса. */
+  status: string | null
+  /** id ролей (в порядке ролей сервера). */
+  roles: string[]
 }
 
 /** Аккаунт для входа по логину (сервер с аккаунтами). Видит только администратор. */
@@ -47,6 +64,19 @@ export interface FileInfo {
   thumbId: string | null
 }
 
+/** Сообщение, на которое отвечают: короткая выжимка для цитаты. */
+export interface ReplyRef {
+  id: number
+  authorId: string
+  authorName: string
+  /** Начало текста (обрезано до LIMITS.replySnippetLength). */
+  content: string
+  /** Сколько файлов было в исходном сообщении. */
+  attachments: number
+  /** Исходное сообщение уже удалено. */
+  deleted: boolean
+}
+
 export interface Message {
   /** Монотонный id — по нему же идёт пагинация истории. */
   id: number
@@ -58,10 +88,29 @@ export interface Message {
   /** id упомянутых пользователей; 'everyone' — упоминание всех. */
   mentions: string[]
   attachments: FileInfo[]
+  /** Ответ на другое сообщение этого же канала. */
+  replyTo: ReplyRef | null
   createdAt: number
   editedAt: number | null
   /** Эхо клиентского nonce — чтобы отправитель сопоставил своё сообщение. */
   nonce?: string
+}
+
+/** Непрочитанное в канале для конкретного участника. */
+export interface UnreadInfo {
+  /** Последнее прочитанное сообщение (0 — ничего не читал). */
+  lastReadId: number
+  count: number
+  /** Сколько из них — упоминания, ответы или личные сообщения. */
+  mentions: number
+  /** Первое непрочитанное — к нему ведёт кнопка «к непрочитанным». */
+  firstUnreadId: number | null
+}
+
+/** Подписка браузера на push (то, что отдаёт PushSubscription.toJSON()). */
+export interface PushSubscriptionJson {
+  endpoint: string
+  keys: { p256dh: string; auth: string }
 }
 
 /* ---------------- Голос и медиа ---------------- */
@@ -164,9 +213,17 @@ export interface AdminStats {
 export interface ServerSnapshot {
   serverName: string
   serverVersion: string
+  /** Каналы сервера и личные каналы этого участника. */
   channels: Channel[]
   users: UserInfo[]
   you: UserInfo
+  roles: Role[]
+  /** Готовые статусы (по умолчанию и добавленные администратором). */
+  statusPresets: string[]
+  /** Непрочитанное по каналам (только где оно есть). */
+  unread: Record<string, UnreadInfo>
+  /** Публичный ключ VAPID для push-уведомлений; null — push на сервере выключен. */
+  pushKey: string | null
   voiceStates: VoiceState[]
   /** null — голос работает; иначе причина, почему SFU недоступен. */
   voiceError: string | null
@@ -191,10 +248,20 @@ export interface RequestMap {
   }
   'password-change': { oldPassword: string; newPassword: string }
   ping: Record<string, never>
-  'msg-send': { channelId: string; content: string; nonce?: string; attachments?: string[] }
+  'msg-send': { channelId: string; content: string; nonce?: string; attachments?: string[]; replyTo?: number }
   'msg-edit': { messageId: number; content: string }
   'msg-delete': { messageId: number }
   'msg-history': { channelId: string; before?: number; limit?: number }
+  /** Прочитано до этого сообщения включительно. */
+  'msg-read': { channelId: string; messageId: number }
+  /** Поиск по тексту сообщений (во всех доступных каналах или в одном). */
+  'msg-search': { query: string; channelId?: string; before?: number; limit?: number }
+  /** Свой статус: текст или null (убрать). */
+  'status-set': { text: string | null }
+  /** Личная переписка с участником: открыть (создать, если ещё нет). */
+  'dm-open': { userId: string }
+  'push-subscribe': { subscription: PushSubscriptionJson }
+  'push-unsubscribe': { endpoint: string }
   /** avatar: id загруженного файла, null — убрать аватарку, не указан — не менять. */
   'profile-update': { nickname: string; avatar?: string | null }
   typing: { channelId: string }
@@ -229,6 +296,11 @@ export interface RequestMap {
   /** password — задать новый пароль; disabled — запретить вход. */
   'account-update': { accountId: string; password?: string; isAdmin?: boolean; disabled?: boolean }
   'account-delete': { accountId: string }
+  'status-presets-set': { presets: string[] }
+  'role-create': { name: string; color: string }
+  'role-update': { roleId: string; name?: string; color?: string }
+  'role-delete': { roleId: string }
+  'role-assign': { userId: string; roleId: string; assigned: boolean }
 }
 
 export interface ResponseMap {
@@ -238,6 +310,12 @@ export interface ResponseMap {
   'msg-edit': { message: Message }
   'msg-delete': { messageId: number }
   'msg-history': { channelId: string; messages: Message[]; hasMore: boolean }
+  'msg-read': Record<string, never>
+  'msg-search': { messages: Message[]; hasMore: boolean }
+  'status-set': { user: UserInfo }
+  'dm-open': { channel: Channel }
+  'push-subscribe': Record<string, never>
+  'push-unsubscribe': Record<string, never>
   'profile-update': { user: UserInfo }
   typing: Record<string, never>
 
@@ -270,6 +348,11 @@ export interface ResponseMap {
   'account-create': { account: AccountInfo }
   'account-update': { account: AccountInfo }
   'account-delete': Record<string, never>
+  'status-presets-set': { presets: string[] }
+  'role-create': { role: Role }
+  'role-update': { role: Role }
+  'role-delete': Record<string, never>
+  'role-assign': { user: UserInfo }
 }
 
 export type RequestType = keyof RequestMap
@@ -285,6 +368,10 @@ export interface EventMap {
   'user-left': { userId: string }
   'user-updated': { user: UserInfo }
   'channels-updated': { channels: Channel[] }
+  /** Другое устройство этого же участника прочитало канал. */
+  'channel-read': { channelId: string; lastReadId: number }
+  'roles-updated': { roles: Role[] }
+  'status-presets': { presets: string[] }
   'server-closing': { reason: string }
 
   /** state = null — пользователь вышел из голоса. */
@@ -301,6 +388,8 @@ export interface EventMap {
   'server-settings': { maxUploadBytes: number }
   /** SFU перезапущен — клиенты в голосе должны переподключиться. */
   'voice-reset': { reason: string }
+  /** Голос перехватило другое устройство этого же участника: здесь из канала нужно выйти без повторного входа. */
+  'voice-taken': { reason: string }
 }
 
 export type EventType = keyof EventMap

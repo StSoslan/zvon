@@ -3,7 +3,8 @@ import { useTranslation } from 'react-i18next'
 import type { AppSettings, PttBinding } from '../../../preload/api'
 import { LANGUAGES, setLanguage, type Language } from '../i18n'
 import { useApp } from '../store/app'
-import { updateVoiceSettings } from '../store/voice'
+import { previewSound, updateVoiceSettings } from '../store/voice'
+import { disablePush, enablePush, pushNeedsHomeScreen, pushSupported } from '../lib/push'
 import { aiNoiseAvailable, type NoiseMode } from '../voice/settings'
 import { playSound } from '../voice/sounds'
 import { diagText, onDiag } from '../voice/diag'
@@ -105,10 +106,22 @@ function MicMeter({ onPermission }: { onPermission: () => void }) {
       <div className="field-label">{t('voice.micTest')}</div>
       <div className="meter">
         <div className={level > 0.55 ? 'meter-fill loud' : 'meter-fill'} style={{ width: `${Math.round(level * 100)}%` }} />
+        {settings.micSensitivity < 0 && (
+          <div className="meter-mark" style={{ left: `${Math.round(Math.min(1, Math.max(0, (settings.micSensitivity + 60) / 60)) * 100)}%` }} />
+        )}
       </div>
       <p className="hint">{error ?? t('voice.micTestHint')}</p>
     </div>
   )
+}
+
+/** Что сейчас реально делает микрофон (видно, работает ли нейросеть). */
+function MicProcessingLine() {
+  const { t } = useTranslation()
+  const processing = useApp((s) => s.micProcessing)
+  const inChannel = useApp((s) => s.voiceChannelId !== null)
+  if (!inChannel || !processing) return null
+  return <p className="hint mic-processing">{t('voice.micProcessingNow', { what: t(`voice.micProcessing_${processing}`) })}</p>
 }
 
 function PttKeyPicker() {
@@ -245,6 +258,30 @@ function VoiceTab() {
         <p className="hint">
           {!aiNoiseAvailable() ? t('voice.noiseAiUnavailable') : settings.noiseMode === 'ai' ? t('voice.noiseAiHint') : t('voice.noiseStandardHint')}
         </p>
+        <MicProcessingLine />
+        <div className="field-label">{t('voice.micSensitivity')}</div>
+        <label className="checkbox">
+          <input
+            type="checkbox"
+            checked={settings.micSensitivity === 0}
+            onChange={(e) => updateVoiceSettings({ micSensitivity: e.target.checked ? 0 : -50 })}
+          />
+          {t('voice.micSensitivityAuto')}
+        </label>
+        {settings.micSensitivity !== 0 && (
+          <label className="field">
+            <span className="field-label">{t('voice.micSensitivityValue', { db: settings.micSensitivity })}</span>
+            <input
+              type="range"
+              min={-90}
+              max={-20}
+              step={1}
+              value={settings.micSensitivity}
+              onChange={(e) => updateVoiceSettings({ micSensitivity: Number(e.target.value) })}
+            />
+          </label>
+        )}
+        <p className="hint">{t(aiNoiseAvailable() ? 'voice.micSensitivityHint' : 'voice.micSensitivityUnavailable')}</p>
         <label className="checkbox">
           <input
             type="checkbox"
@@ -310,6 +347,42 @@ export function VoiceSettingsDialog({ onClose, initialTab = 'voice' }: { onClose
   )
 }
 
+/** Push-уведомления веб-версии: нужны, чтобы телефон будил закрытую вкладку. */
+function PushSection() {
+  const { t } = useTranslation()
+  const pushKey = useApp((s) => s.pushKey)
+  const enabled = useApp((s) => s.pushEnabled)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  // В Safari на iPhone push-API нет вовсе, но раздел нужен: он объясняет, что делать (добавить на экран «Домой»).
+  if (!pushSupported() && !(IS_WEB && pushNeedsHomeScreen())) return null
+  const toggle = async (): Promise<void> => {
+    setBusy(true)
+    setError(null)
+    if (enabled) await disablePush()
+    else setError(await enablePush())
+    setBusy(false)
+  }
+  return (
+    <div className="push-section">
+      <div className="field-label">{t('settings.push')}</div>
+      {!pushKey ? (
+        <p className="hint">{t('settings.pushUnsupported')}</p>
+      ) : pushNeedsHomeScreen() ? (
+        <p className="hint">{t('settings.pushIos')}</p>
+      ) : (
+        <>
+          <button className={enabled ? 'btn btn-small btn-secondary' : 'btn btn-small btn-primary'} disabled={busy} onClick={() => void toggle()}>
+            {enabled ? t('settings.pushOff') : t('settings.pushOn')}
+          </button>
+          <p className="hint">{t('settings.pushHint')}</p>
+        </>
+      )}
+      {error && <div className="error-box">{error}</div>}
+    </div>
+  )
+}
+
 function NotifyTab() {
   const { t } = useTranslation()
   const settings = useApp((s) => s.voiceSettings)
@@ -337,6 +410,24 @@ function NotifyTab() {
         <input type="checkbox" checked={settings.sounds} onChange={(e) => updateVoiceSettings({ sounds: e.target.checked })} />
         {t('voice.sounds')}
       </label>
+      <label className="field">
+        <span className="field-label">{t('voice.soundVolume', { value: Math.round(settings.soundVolume * 100) })}</span>
+        <div className="field-inline">
+          <input
+            type="range"
+            min={0}
+            max={200}
+            step={5}
+            value={Math.round(settings.soundVolume * 100)}
+            disabled={!settings.sounds}
+            onChange={(e) => updateVoiceSettings({ soundVolume: Number(e.target.value) / 100 })}
+          />
+          <button className="btn btn-small btn-secondary" disabled={!settings.sounds} onClick={() => previewSound('join')}>
+            {t('voice.soundTest')}
+          </button>
+        </div>
+      </label>
+      <PushSection />
       <div className="button-row">
         <button
           className="btn btn-small btn-secondary"

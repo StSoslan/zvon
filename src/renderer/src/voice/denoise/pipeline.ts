@@ -8,12 +8,22 @@
  */
 import createRNNWasmModuleSync from '@jitsi/rnnoise-wasm/dist/rnnoise-sync.js'
 import type { DeepFilter } from './dfn'
-import { GATE_AFTER_DFN, GATE_STRICT, SpeechGate } from './gate'
+import { GATE_AFTER_DFN, GATE_LEVEL_ONLY, GATE_STRICT, SpeechGate } from './gate'
 
 export const FRAME = 480
 export const SAMPLE_RATE = 48000
 
-export type DenoiseEngine = 'dfn' | 'rnnoise'
+/** none — шум не убираем, работает только порог чувствительности микрофона. */
+export type DenoiseEngine = 'dfn' | 'rnnoise' | 'none'
+
+export interface PipelineOptions {
+  /** Убирать шум (DeepFilterNet или RNNoise); false — только шлюз по громкости. */
+  denoise: boolean
+  /** Чувствительность микрофона, дБFS; null — авто. */
+  thresholdDb: number | null
+  /** false — шлюз только задерживает звук, но не закрывается (для проверок). */
+  useGate?: boolean
+}
 
 /** Первую секунду нейросеть «разогревается» и пропускает часть стука — шлюз в это время строгий. */
 const WARMUP_FRAMES = 100
@@ -68,20 +78,26 @@ export class DenoisePipeline {
   private dfn: DeepFilter | null
   private readonly rnnoise = new Rnnoise()
   private readonly gate: SpeechGate
-  /** false — шлюз только задерживает звук, но не закрывается (для проверок). */
   private readonly useGate: boolean
+  private readonly denoise: boolean
   private frames = 0
 
-  /** dfn = null — сразу упрощённый режим (только RNNoise). */
-  constructor(dfn: DeepFilter | null, useGate = true) {
+  /** dfn = null при denoise — упрощённый режим (только RNNoise). */
+  constructor(dfn: DeepFilter | null, opts: PipelineOptions) {
     if (dfn && dfn.frameLength !== FRAME) throw new Error(`DeepFilterNet: неожиданный размер кадра ${dfn.frameLength}`)
-    this.dfn = dfn
-    this.useGate = useGate
-    this.gate = new SpeechGate(GATE_STRICT)
+    this.dfn = opts.denoise ? dfn : null
+    this.denoise = opts.denoise
+    this.useGate = opts.useGate ?? true
+    this.gate = new SpeechGate(opts.denoise ? GATE_STRICT : GATE_LEVEL_ONLY)
+    this.gate.setThreshold(opts.thresholdDb)
   }
 
   get engine(): DenoiseEngine {
-    return this.dfn ? 'dfn' : 'rnnoise'
+    return this.dfn ? 'dfn' : this.denoise ? 'rnnoise' : 'none'
+  }
+
+  setThreshold(thresholdDb: number | null): void {
+    this.gate.setThreshold(thresholdDb)
   }
 
   /** Отказаться от DeepFilterNet (ошибка или слабый процессор) и продолжить на RNNoise. */
@@ -99,7 +115,10 @@ export class DenoisePipeline {
   process(frame: Float32Array): Float32Array {
     let clean: Float32Array
     let vad: number
-    if (this.dfn) {
+    if (!this.denoise) {
+      clean = frame
+      vad = 1
+    } else if (this.dfn) {
       if (++this.frames === WARMUP_FRAMES) this.gate.setOptions(GATE_AFTER_DFN)
       clean = this.dfn.process(frame)
       // Детектор слушает уже очищенный звук: стук и шум до него не доходят.

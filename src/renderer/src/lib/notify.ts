@@ -2,7 +2,7 @@
  * Уведомления ОС о новых сообщениях и звук сообщения.
  * Не беспокоим, если человек и так смотрит на этот канал.
  */
-import type { Message } from '../../../shared/types'
+import type { Channel, Message } from '../../../shared/types'
 import { getApp } from '../store/app'
 import { playSound } from '../voice/sounds'
 
@@ -17,9 +17,13 @@ function shortBody(m: Message): string {
   return `📎 Файлов: ${n}`
 }
 
-export function notifyIncoming(m: Message, mentioned: boolean, onOpen: () => void): void {
+/**
+ * @param mentioned сообщение касается лично меня: упоминание, ответ на моё, личная переписка
+ */
+export function notifyIncoming(m: Message, mentioned: boolean, channel: Channel | undefined, onOpen: () => void): void {
   const s = getApp()
   const settings = s.voiceSettings
+  if (m.authorId === s.me?.id) return
   const visible = s.windowFocused && s.mainView === 'chat' && s.currentChannelId === m.channelId
   if (visible) return
 
@@ -33,8 +37,16 @@ export function notifyIncoming(m: Message, mentioned: boolean, onOpen: () => voi
   if (s.windowFocused) return
   try {
     const author = s.users[m.authorId]?.nickname ?? m.authorName
-    const channel = s.channels.find((c) => c.id === m.channelId)?.name ?? ''
-    const n = new Notification(mentioned ? `${author} упомянул(а) вас в #${channel}` : `${author} в #${channel}`, {
+    const isDm = channel?.type === 'dm'
+    const where = isDm ? '' : ` в #${channel?.name ?? ''}`
+    const title = isDm
+      ? author
+      : m.replyTo && m.replyTo.authorId === s.me?.id
+        ? `${author} ответил(а) вам${where}`
+        : mentioned
+          ? `${author} упомянул(а) вас${where}`
+          : `${author}${where}`
+    const n = new Notification(title, {
       body: settings.notifyPreview ? shortBody(m) : 'Новое сообщение',
       tag: `zvon-${m.channelId}`,
       silent: true

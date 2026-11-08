@@ -1337,9 +1337,14 @@ input[type='range'] {
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
 
-.message:hover .message-actions,
 .message-actions.visible {
   display: flex;
+}
+/* Наведение есть только у мыши: на сенсоре iOS «наведение» залипает после нажатия. */
+@media (hover: hover) {
+  .message:hover .message-actions {
+    display: flex;
+  }
 }
 
 .mention {
@@ -2810,4 +2815,452 @@ input[type='range'] {
   word-break: break-word;
   user-select: text;
   -webkit-user-select: text;
+}
+
+/* ===== Ответы (цитаты) ===== */
+.reply-quote {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  margin: 0 0 2px;
+  padding: 2px 8px 2px 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+}
+.reply-quote:disabled {
+  cursor: default;
+}
+.reply-quote:not(:disabled):hover .reply-text {
+  color: var(--text);
+}
+.reply-author {
+  color: var(--text-strong);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.reply-text,
+.reply-deleted {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.reply-deleted {
+  font-style: italic;
+}
+.reply-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  margin: 0 0 4px;
+  border-radius: var(--radius) var(--radius) 0 0;
+  background: var(--bg-3);
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.reply-bar-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.reply-bar-text b {
+  color: var(--text-strong);
+}
+
+/* ===== Непрочитанные ===== */
+.messages-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+.messages-wrap .messages {
+  flex: 1;
+}
+.unread-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+.unread-bar:hover {
+  background: var(--accent-hover);
+}
+.unread-bar-dismiss {
+  margin-left: auto;
+  opacity: 0.8;
+  text-decoration: underline;
+}
+.new-sep {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 16px 4px;
+  color: var(--red);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.new-sep::before,
+.new-sep::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--red);
+}
+.new-sep.muted {
+  color: var(--text-muted);
+  text-transform: none;
+  font-weight: 400;
+}
+.new-sep.muted::before,
+.new-sep.muted::after {
+  background: var(--bg-3);
+}
+.message-highlight > .message {
+  animation: msg-flash 2.5s ease-out;
+}
+@keyframes msg-flash {
+  0%,
+  40% {
+    background: rgba(88, 101, 242, 0.25);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+/* ===== Поиск ===== */
+.chat-header-spacer {
+  flex: 1;
+}
+.chat-header-status {
+  margin-left: 6px;
+  font-size: 13px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chat-header .icon-btn.active {
+  color: var(--text-strong);
+  background: var(--bg-active);
+}
+.search-panel {
+  position: absolute;
+  top: 48px;
+  right: 0;
+  bottom: 0;
+  width: min(420px, 100%);
+  z-index: 25;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-1);
+  border-left: 1px solid var(--bg-0);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.3);
+}
+.search-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  color: var(--text-muted);
+}
+.search-head input {
+  flex: 1;
+  min-width: 0;
+}
+.search-scope {
+  margin: 0 12px 6px;
+}
+.search-results {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 8px 12px;
+}
+.search-result {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  margin-bottom: 4px;
+  border: none;
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.search-result:hover {
+  background: var(--bg-hover);
+}
+.search-result-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.search-result-author {
+  color: var(--text-strong);
+  font-weight: 600;
+}
+.search-result-where {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.search-result-time {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.search-result-text {
+  font-size: 14px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.search-more {
+  margin: 8px auto;
+  display: block;
+}
+
+/* ===== Личные сообщения в списке каналов ===== */
+.channel-dm {
+  gap: 8px;
+}
+.channel-dm .avatar {
+  flex: 0 0 auto;
+}
+.channel-dm .badge {
+  margin-left: auto;
+}
+
+/* ===== Роли и статусы ===== */
+.tag-role {
+  border: 1px solid currentColor;
+  background: transparent;
+}
+.member {
+  border: none;
+  background: none;
+  font: inherit;
+  text-align: left;
+  width: 100%;
+  cursor: pointer;
+}
+.member:disabled {
+  cursor: default;
+}
+.member-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+.member-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
+}
+.member-status {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-panel-me {
+  position: relative;
+}
+.user-panel-avatar,
+.user-panel-name button {
+  border: none;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.user-panel-name .name {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.user-panel-name .status {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.user-panel-name .status.has-status {
+  color: var(--yellow);
+}
+.user-panel-name .status:hover {
+  color: var(--text-strong);
+}
+.status-menu {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  width: 280px;
+  max-width: calc(100vw - 32px);
+  z-index: 40;
+  padding: 6px;
+  border-radius: var(--radius);
+  background: var(--bg-0);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.status-menu-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.status-menu .dropdown-item.active {
+  color: var(--yellow);
+}
+.status-custom {
+  display: flex;
+  gap: 6px;
+  padding: 6px 4px;
+}
+.status-custom input {
+  flex: 1;
+  min-width: 0;
+}
+.role-create input[type='color'],
+.role-head input[type='color'] {
+  width: 36px;
+  height: 32px;
+  padding: 2px;
+  border: none;
+  border-radius: 6px;
+  background: var(--bg-input);
+  cursor: pointer;
+}
+.role-row {
+  padding: 10px 0;
+  border-top: 1px solid var(--bg-3);
+}
+.role-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.role-name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+}
+.role-members {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  align-items: center;
+}
+.role-members select {
+  width: auto;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 3px 4px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  font-size: 13px;
+}
+.chip-x {
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.chip-x:hover {
+  color: var(--red);
+}
+.preset-list {
+  list-style: none;
+  margin: 0 0 10px;
+  padding: 0;
+}
+.preset-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+}
+.preset-list li:hover {
+  background: var(--bg-hover);
+}
+.meter {
+  position: relative;
+}
+.meter-mark {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 2px;
+  background: var(--yellow);
+  border-radius: 1px;
+}
+.mic-processing {
+  color: var(--green);
+}
+.push-section {
+  margin-top: 8px;
+}
+.dropdown-item.danger {
+  color: var(--red);
+}
+
+/* Сенсорные экраны: действия над сообщением по нажатию */
+.message.selected {
+  background: rgba(255, 255, 255, 0.04);
+}
+.message.selected .message-actions {
+  display: flex;
 }

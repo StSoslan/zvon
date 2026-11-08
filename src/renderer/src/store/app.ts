@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type { HostStatus, InitialState, ProbeResult, PttSupport, RecentServer } from '../../../preload/api'
-import type { Channel, FileInfo, Message, UserInfo, VoiceState } from '../../../shared/types'
+import type { Channel, FileInfo, Message, Role, UnreadInfo, UserInfo, VoiceState } from '../../../shared/types'
 import type { ConnStatus } from '../net/client'
 import type { LocalMedia, RemoteVideoView, VoiceStatus } from '../voice/engine'
 import { loadVoiceSettings, type VoiceSettings } from '../voice/settings'
@@ -17,9 +17,26 @@ export interface PendingMessage {
   channelId: string
   content: string
   attachments: FileInfo[]
+  /** Сообщение, на которое отвечаем. */
+  replyTo: Message | null
   createdAt: number
   failed: boolean
 }
+
+/** Поиск по сообщениям: запрос и найденное. */
+export interface SearchState {
+  open: boolean
+  query: string
+  /** Искать только в текущем канале. */
+  currentOnly: boolean
+  results: Message[]
+  hasMore: boolean
+  loading: boolean
+  error: string | null
+}
+
+/** Что сейчас делает микрофон (для настроек): какое шумоподавление реально работает. */
+export type MicProcessing = 'dfn' | 'rnnoise' | 'builtin' | 'off'
 
 /** Файл в поле ввода: готовится, загружается или уже на хосте. */
 export interface DraftAttachment {
@@ -84,8 +101,25 @@ export interface AppState {
   messages: Record<string, ChannelMessages>
   pending: Record<string, PendingMessage[]>
   typing: Record<string, Record<string, number>>
-  unread: Record<string, { count: number; mentions: number }>
+  unread: Record<string, UnreadInfo>
+  /**
+   * Граница «новые сообщения» в открытом канале: первое непрочитанное на момент открытия.
+   * Счётчик уже сброшен, а черта и кнопка «к непрочитанным» остаются, пока канал открыт.
+   */
+  newMark: Record<string, { firstUnreadId: number; count: number }>
   editingId: number | null
+  /** Сообщение, на которое пишется ответ (по каналам). */
+  replyTo: Record<string, Message>
+  /** К какому сообщению прокрутить и подсветить (nonce меняется при каждом прыжке). */
+  jump: { channelId: string; messageId: number; nonce: number } | null
+  search: SearchState
+  roles: Role[]
+  statusPresets: string[]
+  /** Публичный ключ push-уведомлений сервера; null — выключены. */
+  pushKey: string | null
+  /** Включены ли push на этом устройстве (веб-версия). */
+  pushEnabled: boolean
+  micProcessing: MicProcessing | null
   windowFocused: boolean
 
   /* ---- голос ---- */
@@ -138,6 +172,8 @@ const emptyHost: HostStatus = {
   voiceError: null
 }
 
+export const EMPTY_SEARCH: SearchState = { open: false, query: '', currentOnly: false, results: [], hasMore: false, loading: false, error: null }
+
 export const initialServerState = {
   serverName: '',
   me: null,
@@ -148,7 +184,16 @@ export const initialServerState = {
   pending: {},
   typing: {},
   unread: {},
+  newMark: {},
   editingId: null,
+  replyTo: {},
+  jump: null,
+  search: EMPTY_SEARCH,
+  roles: [],
+  statusPresets: [],
+  pushKey: null,
+  pushEnabled: false,
+  micProcessing: null,
   voiceChannelId: null,
   voiceStatus: 'idle',
   voiceError: null,

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { LIMITS } from '../../../shared/constants'
-import type { AccountInfo, AdminSettings, AdminStats, Channel, ChannelType } from '../../../shared/types'
+import type { AccountInfo, AdminSettings, AdminStats, Channel, ChannelType, Role, UserInfo } from '../../../shared/types'
 import { formatSize } from '../lib/files'
 import { useApp } from '../store/app'
 import { adminRequest } from '../store/session'
@@ -9,7 +9,7 @@ import { Avatar, Modal } from './Common'
 import { FirewallCard } from './Firewall'
 import { HashIcon, TrashIcon, VolumeIcon } from './Icons'
 
-type Tab = 'accounts' | 'users' | 'channels' | 'load' | 'settings'
+type Tab = 'accounts' | 'users' | 'roles' | 'statuses' | 'channels' | 'load' | 'settings'
 
 const POLL_MS = 2_000
 const HISTORY = 60
@@ -34,7 +34,9 @@ export function HostPanel({ onClose }: { onClose: () => void }) {
   const { t } = useTranslation()
   const hasAccounts = useApp((s) => s.account !== null)
   const [tab, setTab] = useState<Tab>(hasAccounts ? 'accounts' : 'users')
-  const tabs: Tab[] = hasAccounts ? ['accounts', 'users', 'channels', 'load', 'settings'] : ['users', 'channels', 'load', 'settings']
+  const tabs: Tab[] = hasAccounts
+    ? ['accounts', 'users', 'roles', 'statuses', 'channels', 'load', 'settings']
+    : ['users', 'roles', 'statuses', 'channels', 'load', 'settings']
   const [stats, setStats] = useState<AdminStats | null>(null)
   const [history, setHistory] = useState<Array<{ send: number; recv: number }>>([])
   const [error, setError] = useState<string | null>(null)
@@ -71,6 +73,8 @@ export function HostPanel({ onClose }: { onClose: () => void }) {
       {error && <div className="error-box">{error}</div>}
       {tab === 'accounts' && <AccountsTab />}
       {tab === 'users' && <UsersTab stats={stats} />}
+      {tab === 'roles' && <RolesTab />}
+      {tab === 'statuses' && <StatusesTab />}
       {tab === 'channels' && <ChannelsTab />}
       {tab === 'load' && <LoadTab stats={stats} history={history} />}
       {tab === 'settings' && <SettingsTab stats={stats} />}
@@ -490,6 +494,178 @@ function SettingsTab({ stats }: { stats: AdminStats | null }) {
         {t('common.save')}
       </button>
       {isOwn && hostStatus.port && hostStatus.rtcPort && <FirewallCard port={hostStatus.port} rtcPort={hostStatus.rtcPort} />}
+    </div>
+  )
+}
+
+const ROLE_COLORS = ['#5865f2', '#23a55a', '#f0b232', '#f23f43', '#eb459e', '#3ba55c', '#1abc9c', '#e67e22', '#9b59b6', '#95a5a6']
+
+/** Роли: цветные метки, которые администратор выдаёт участникам. Прав роли не дают. */
+function RolesTab() {
+  const { t } = useTranslation()
+  const roles = useApp((s) => s.roles)
+  const users = useApp((s) => s.users)
+  const [name, setName] = useState('')
+  const [color, setColor] = useState(ROLE_COLORS[0])
+  const [error, setError] = useState<string | null>(null)
+  const run = (p: Promise<unknown>): void => {
+    setError(null)
+    p.catch((err) => setError(errText(err)))
+  }
+  const all = Object.values(users).sort((a, b) => a.nickname.localeCompare(b.nickname))
+
+  return (
+    <div className="admin-section">
+      {error && <div className="error-box">{error}</div>}
+      <form
+        className="admin-create role-create"
+        onSubmit={(e) => {
+          e.preventDefault()
+          if (!name.trim()) return
+          run(
+            adminRequest('role-create', { name: name.trim(), color }).then(() => {
+              setName('')
+              setColor(ROLE_COLORS[(roles.length + 1) % ROLE_COLORS.length])
+            })
+          )
+        }}
+      >
+        <input type="color" value={color} title={t('admin.roleColor')} onChange={(e) => setColor(e.target.value)} />
+        <input value={name} maxLength={LIMITS.roleNameLength} placeholder={t('admin.roleName')} onChange={(e) => setName(e.target.value)} />
+        <button className="btn btn-small btn-primary" type="submit" disabled={!name.trim()}>
+          {t('admin.create')}
+        </button>
+      </form>
+      <p className="hint">{t('admin.rolesHint')}</p>
+      {roles.length === 0 && <p className="hint">{t('admin.rolesEmpty')}</p>}
+      {roles.map((r) => (
+        <RoleRow key={r.id} role={r} users={all} onError={setError} />
+      ))}
+    </div>
+  )
+}
+
+function RoleRow({ role, users, onError }: { role: Role; users: UserInfo[]; onError: (e: string | null) => void }) {
+  const { t } = useTranslation()
+  const [name, setName] = useState(role.name)
+  const [pick, setPick] = useState('')
+  useEffect(() => setName(role.name), [role.name])
+  const run = (p: Promise<unknown>): void => {
+    onError(null)
+    p.catch((err) => onError(errText(err)))
+  }
+  const members = users.filter((u) => u.roles.includes(role.id))
+  const candidates = users.filter((u) => !u.roles.includes(role.id))
+  return (
+    <div className="role-row">
+      <div className="role-head">
+        <input type="color" value={role.color} title={t('admin.roleColor')} onChange={(e) => run(adminRequest('role-update', { roleId: role.id, color: e.target.value }))} />
+        <input
+          className="role-name"
+          value={name}
+          maxLength={LIMITS.roleNameLength}
+          style={{ color: role.color }}
+          onChange={(e) => setName(e.target.value)}
+          onBlur={() => {
+            const v = name.trim()
+            if (v && v !== role.name) run(adminRequest('role-update', { roleId: role.id, name: v }))
+            else setName(role.name)
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') e.currentTarget.blur()
+          }}
+        />
+        <button
+          className="btn btn-small btn-danger"
+          title={t('common.delete')}
+          onClick={() => {
+            if (window.confirm(t('admin.roleDeleteConfirm', { name: role.name }))) run(adminRequest('role-delete', { roleId: role.id }))
+          }}
+        >
+          <TrashIcon width={14} height={14} />
+        </button>
+      </div>
+      <div className="role-members">
+        {members.map((u) => (
+          <span key={u.id} className="chip">
+            <Avatar id={u.id} nickname={u.nickname} size={18} />
+            {u.nickname}
+            <button className="chip-x" title={t('admin.roleRemove')} onClick={() => run(adminRequest('role-assign', { userId: u.id, roleId: role.id, assigned: false }))}>
+              ×
+            </button>
+          </span>
+        ))}
+        {candidates.length > 0 && (
+          <select
+            value={pick}
+            onChange={(e) => {
+              const userId = e.target.value
+              setPick('')
+              if (userId) run(adminRequest('role-assign', { userId, roleId: role.id, assigned: true }))
+            }}
+          >
+            <option value="">{t('admin.roleAdd')}</option>
+            {candidates.map((u) => (
+              <option key={u.id} value={u.id}>
+                {u.nickname}
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/** Готовые статусы, которые участники выбирают одним нажатием. */
+function StatusesTab() {
+  const { t } = useTranslation()
+  const presets = useApp((s) => s.statusPresets)
+  const [draft, setDraft] = useState<string[]>(presets)
+  const [add, setAdd] = useState('')
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null)
+  useEffect(() => setDraft(presets), [presets])
+  const changed = JSON.stringify(draft) !== JSON.stringify(presets)
+
+  const save = (): void => {
+    setMsg(null)
+    adminRequest('status-presets-set', { presets: draft })
+      .then(() => setMsg({ ok: true, text: t('admin.saved') }))
+      .catch((err) => setMsg({ ok: false, text: errText(err) }))
+  }
+
+  return (
+    <div className="admin-section">
+      <p className="hint">{t('admin.statusesHint')}</p>
+      <ul className="preset-list">
+        {draft.map((p, i) => (
+          <li key={i}>
+            <span>{p}</span>
+            <button className="icon-btn danger" title={t('common.delete')} onClick={() => setDraft(draft.filter((_, j) => j !== i))}>
+              <TrashIcon width={14} height={14} />
+            </button>
+          </li>
+        ))}
+      </ul>
+      <form
+        className="admin-create"
+        onSubmit={(e) => {
+          e.preventDefault()
+          const v = add.trim()
+          if (!v || draft.includes(v) || draft.length >= LIMITS.statusPresets) return
+          setDraft([...draft, v])
+          setAdd('')
+        }}
+      >
+        <input value={add} maxLength={LIMITS.statusLength} placeholder={t('admin.statusNew')} onChange={(e) => setAdd(e.target.value)} />
+        <button className="btn btn-small btn-secondary" type="submit" disabled={!add.trim()}>
+          {t('admin.add')}
+        </button>
+        <button className="btn btn-small btn-primary" type="button" disabled={!changed} onClick={save}>
+          {t('common.save')}
+        </button>
+      </form>
+      {msg && <div className={msg.ok ? 'success-box' : 'error-box'}>{msg.text}</div>}
     </div>
   )
 }

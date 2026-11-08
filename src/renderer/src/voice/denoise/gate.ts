@@ -55,14 +55,30 @@ export const GATE_STRICT: GateOptions = {
   closeLevel: Infinity
 }
 
+/** Шлюз только по громкости (без детектора речи): для чувствительности микрофона без шумоподавления. */
+export const GATE_LEVEL_ONLY: GateOptions = {
+  ...GATE_AFTER_DFN,
+  openVad: Infinity,
+  closeVad: Infinity,
+  openLevel: Infinity,
+  closeLevel: Infinity
+}
+
 export class SpeechGate {
   private opts: GateOptions
   private readonly delay: Float32Array[] = []
   private hold = 0
   private gain = 0
+  /** Чувствительность микрофона: тише этого уровня (rms, 0…1) речью не считается; null — не ограничивать. */
+  private minLevel: number | null = null
 
   constructor(opts: GateOptions) {
     this.opts = opts
+  }
+
+  /** Порог чувствительности в дБFS (например −50); null — авто. */
+  setThreshold(dbfs: number | null): void {
+    this.minLevel = dbfs === null ? null : db(dbfs)
   }
 
   /** Сменить пороги на лету (упреждение менять нельзя — от него зависит задержка звука). */
@@ -78,12 +94,23 @@ export class SpeechGate {
   process(frame: Float32Array, vad: number): Float32Array {
     const o = this.opts
     const open = this.hold > 0
-    let speech = vad >= (open ? o.closeVad : o.openVad)
-    if (!speech && Number.isFinite(o.openLevel)) {
-      let sum = 0
-      for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i]
-      speech = Math.sqrt(sum / frame.length) >= (open ? o.closeLevel : o.openLevel)
+    let rms = -1
+    const level = (): number => {
+      if (rms < 0) {
+        let sum = 0
+        for (let i = 0; i < frame.length; i++) sum += frame[i] * frame[i]
+        rms = Math.sqrt(sum / frame.length)
+      }
+      return rms
     }
+    let speech = vad >= (open ? o.closeVad : o.openVad)
+    if (!speech && Number.isFinite(o.openLevel)) speech = level() >= (open ? o.closeLevel : o.openLevel)
+    // Порог чувствительности: пока открыт, отпускаем чуть ниже порога, чтобы не дробить фразу.
+    const levelOnly = !Number.isFinite(o.openVad) && !Number.isFinite(o.openLevel)
+    if (this.minLevel === null) {
+      if (levelOnly) speech = true
+    } else if (level() < (open ? this.minLevel * 0.5 : this.minLevel)) speech = false
+    else if (levelOnly) speech = true
     if (speech) this.hold = o.holdFrames
     else if (open) this.hold--
 

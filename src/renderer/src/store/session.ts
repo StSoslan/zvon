@@ -5,14 +5,15 @@
 import i18n from '../i18n'
 import { LIMITS, TIMINGS } from '../../../shared/constants'
 import type { HostSettings } from '../../../preload/api'
-import type { Channel, FileInfo, Message, RequestMap, RequestType, ResponseMap, ServerSnapshot, UserInfo } from '../../../shared/types'
+import type { Channel, FileInfo, Message, RequestMap, RequestType, ResponseMap, ServerSnapshot, UnreadInfo, UserInfo } from '../../../shared/types'
 import { dataUrlToBlob, uploadBlob } from '../lib/files'
 import { clearAllDrafts } from './uploads'
 import { notifyIncoming } from '../lib/notify'
 import { initTraySync } from './tray'
 import { ServerError, ZvonClient } from '../net/client'
-import { getApp, initialServerState, mergeMessages, patchChannel, setApp, type ConnTarget, type PendingMessage } from './app'
+import { EMPTY_SEARCH, getApp, initialServerState, mergeMessages, patchChannel, setApp, type ConnTarget, type PendingMessage } from './app'
 import { attachVoice, detachVoice, initVoiceGlobal, leaveVoice, onConnStatusForVoice, onVoiceWelcome } from './voice'
+import { applyPendingOpen, initPushNavigation, syncPushSubscription } from '../lib/push'
 
 let client: ZvonClient | null = null
 let lastTypingSent = 0
@@ -45,10 +46,11 @@ export async function bootApp(): Promise<void> {
   window.zvon.onHostStatus((hostStatus) => setApp({ hostStatus }))
   void initVoiceGlobal()
   initTraySync()
+  initPushNavigation()
   window.addEventListener('focus', () => {
     setApp({ windowFocused: true })
     const ch = getApp().currentChannelId
-    if (ch) clearUnread(ch)
+    if (ch && getApp().mainView === 'chat') markChannelRead(ch)
   })
   window.addEventListener('blur', () => setApp({ windowFocused: false }))
 }
@@ -187,29 +189,41 @@ function applySnapshot(s: ServerSnapshot, isReconnect: boolean): void {
   for (const u of s.users) users[u.id] = u
   users[s.you.id] = s.you
   const prev = getApp()
-  const textChannels = s.channels.filter((c) => c.type === 'text')
+  const textChannels = s.channels.filter((c) => c.type !== 'voice')
   const currentStillExists = prev.currentChannelId && textChannels.some((c) => c.id === prev.currentChannelId)
-  const currentChannelId = currentStillExists ? prev.currentChannelId : (textChannels[0]?.id ?? null)
+  const currentChannelId = currentStillExists ? prev.currentChannelId : (textChannels.find((c) => c.type === 'text')?.id ?? null)
 
   setApp({
     serverName: s.serverName,
     me: s.you,
     users,
     channels: s.channels,
+    roles: s.roles,
+    statusPresets: s.statusPresets,
+    pushKey: s.pushKey,
     currentChannelId,
     connNotice: null,
     // После переподключения кэш истории сбрасываем: за время обрыва сообщения могли измениться.
     messages: isReconnect ? {} : prev.messages,
     typing: {},
+    // Непрочитанное хранит сервер — так оно одинаковое на всех устройствах.
+    unread: s.unread,
+    newMark: isReconnect ? prev.newMark : {},
     fileToken: s.fileToken,
     maxUploadBytes: s.maxUploadBytes,
     account: s.account ?? null
   })
-  if (currentChannelId) void loadHistory(currentChannelId)
+  if (currentChannelId) {
+    void loadHistory(currentChannelId)
+    // Открытый канал читается прямо сейчас — его непрочитанное сразу гасим (черта «новые» остаётся).
+    if (prev.windowFocused && prev.mainView === 'chat') rememberNewMark(currentChannelId)
+  }
   if (isReconnect) retryFailedPending()
   // Своя аватарка хранится локально и сама появляется на новых серверах.
   // С аккаунтами аватарка хранится на сервере и одна на всех устройствах — локальную не подставляем.
   else if (!s.you.avatar && !s.account) void applyLocalAvatar()
+  void syncPushSubscription()
+  if (!isReconnect) applyPendingOpen()
 }
 
 const AVATAR_KEY = 'zvon.avatar'
@@ -291,6 +305,18 @@ export async function updateProfile(nickname: string, avatar?: { blob: Blob; dat
   }
 }
 
+/** Свой статус («отошёл, буду в 17:30»); null — убрать. Возвращает текст ошибки или null. */
+export async function setMyStatus(text: string | null): Promise<string | null> {
+  if (!client) return t('conn.lost')
+  try {
+    const { user } = await client.request('status-set', { text: text?.trim() || null })
+    setApp((s) => ({ me: user, users: { ...s.users, [user.id]: user } }))
+    return null
+  } catch (err) {
+    return (err as Error).message
+  }
+}
+
 function wireEvents(c: ZvonClient): void {
   unsubscribers.push(
     c.on('msg-new', ({ message }) => onIncomingMessage(message)),
@@ -299,7 +325,9 @@ function wireEvents(c: ZvonClient): void {
     }),
     c.on('msg-deleted', ({ messageId, channelId }) => {
       patchChannel(channelId, (ch) => ({ ...ch, items: ch.items.filter((m) => m.id !== messageId) }))
-      if (getApp().editingId === messageId) setApp({ editingId: null })
+      const s = getApp()
+      if (s.editingId === messageId) setApp({ editingId: null })
+      if (s.replyTo[channelId]?.id === messageId) setReplyTo(channelId, null)
     }),
     c.on('typing', ({ channelId, userId }) => {
       setApp((s) => ({
@@ -307,7 +335,9 @@ function wireEvents(c: ZvonClient): void {
       }))
     }),
     c.on('user-joined', ({ user }) => setApp((s) => ({ users: { ...s.users, [user.id]: user } }))),
-    c.on('user-updated', ({ user }) => setApp((s) => ({ users: { ...s.users, [user.id]: user } }))),
+    c.on('user-updated', ({ user }) =>
+      setApp((s) => ({ users: { ...s.users, [user.id]: user }, me: s.me?.id === user.id ? user : s.me }))
+    ),
     c.on('user-left', ({ userId }) =>
       setApp((s) => {
         const u = s.users[userId]
@@ -315,9 +345,19 @@ function wireEvents(c: ZvonClient): void {
       })
     ),
     c.on('channels-updated', ({ channels }) => onChannelsUpdated(channels)),
+    c.on('channel-read', ({ channelId, lastReadId }) => onChannelRead(channelId, lastReadId)),
+    c.on('roles-updated', ({ roles }) => setApp({ roles })),
+    c.on('status-presets', ({ presets }) => setApp({ statusPresets: presets })),
     c.on('server-settings', ({ maxUploadBytes }) => setApp({ maxUploadBytes })),
     c.on('server-closing', ({ reason }) => setApp({ connNotice: t('conn.serverClosing', { reason }) }))
   )
+}
+
+/** Сообщение важно лично для меня: упоминание, ответ на моё сообщение или личная переписка. */
+export function isMentioned(m: Message, myId: string | undefined, channel?: Channel): boolean {
+  if (!myId || m.authorId === myId) return false
+  if (channel?.type === 'dm') return true
+  return m.mentions.includes(myId) || m.mentions.includes('everyone') || Boolean(m.replyTo && !m.replyTo.deleted && m.replyTo.authorId === myId)
 }
 
 function onIncomingMessage(message: Message): void {
@@ -333,15 +373,41 @@ function onIncomingMessage(message: Message): void {
     setApp((st) => ({ typing: { ...st.typing, [message.channelId]: rest } }))
   }
 
-  const mentioned = isMentioned(message, s.me?.id)
-  notifyIncoming(message, mentioned, () => selectChannel(message.channelId))
+  const channel = s.channels.find((c) => c.id === message.channelId)
+  const mentioned = isMentioned(message, s.me?.id, channel)
+  notifyIncoming(message, mentioned, channel, () => void jumpToMessage(message.channelId, message.id))
   const visible = message.channelId === s.currentChannelId && s.windowFocused && s.mainView === 'chat'
-  if (!visible) {
+  if (visible) {
+    markChannelRead(message.channelId, message.id)
+  } else if (message.authorId !== s.me?.id) {
     setApp((st) => {
-      const u = st.unread[message.channelId] ?? { count: 0, mentions: 0 }
-      return { unread: { ...st.unread, [message.channelId]: { count: u.count + 1, mentions: u.mentions + (mentioned ? 1 : 0) } } }
+      const u: UnreadInfo = st.unread[message.channelId] ?? { lastReadId: 0, count: 0, mentions: 0, firstUnreadId: null }
+      return {
+        unread: {
+          ...st.unread,
+          [message.channelId]: {
+            ...u,
+            count: u.count + 1,
+            mentions: u.mentions + (mentioned ? 1 : 0),
+            firstUnreadId: u.firstUnreadId ?? message.id
+          }
+        }
+      }
     })
   }
+}
+
+/** Другое устройство прочитало канал — здесь счётчик тоже гаснет. */
+function onChannelRead(channelId: string, lastReadId: number): void {
+  const s = getApp()
+  const u = s.unread[channelId]
+  if (!u) return
+  const items = s.messages[channelId]?.items ?? []
+  const remaining = items.filter((m) => m.id > lastReadId && m.authorId !== s.me?.id)
+  const rest = { ...s.unread }
+  if (remaining.length === 0 || !s.messages[channelId]?.loaded) delete rest[channelId]
+  else rest[channelId] = { ...u, lastReadId, count: remaining.length, firstUnreadId: remaining[0].id }
+  setApp({ unread: rest })
 }
 
 /** Хост изменил каналы: убираем удалённые из кэша, уходим из исчезнувшего голосового канала. */
@@ -357,10 +423,6 @@ function onChannelsUpdated(channels: Channel[]): void {
   setApp({ channels, messages, unread, currentChannelId })
   if (s.voiceChannelId && !ids.has(s.voiceChannelId)) void leaveVoice()
   if (currentChannelId && currentChannelId !== s.currentChannelId) void loadHistory(currentChannelId)
-}
-
-export function isMentioned(m: Message, myId: string | undefined): boolean {
-  return Boolean(myId && m.authorId !== myId && (m.mentions.includes(myId) || m.mentions.includes('everyone')))
 }
 
 function disposeClient(): void {
@@ -437,19 +499,58 @@ export function rememberHostSettings(settings: HostSettings): void {
 /* ======================= чат ======================= */
 
 export function selectChannel(channelId: string): void {
-  setApp({ currentChannelId: channelId, editingId: null, mainView: 'chat' })
-  clearUnread(channelId)
+  setApp({ currentChannelId: channelId, editingId: null, mainView: 'chat', jump: null })
+  rememberNewMark(channelId)
   const ch = getApp().messages[channelId]
   if (!ch?.loaded) void loadHistory(channelId)
 }
 
-function clearUnread(channelId: string): void {
-  if (!getApp().unread[channelId]) return
+/** Канал открыт: запоминаем, где начинается непрочитанное, и гасим счётчик. */
+function rememberNewMark(channelId: string): void {
+  const s = getApp()
+  const u = s.unread[channelId]
+  const newMark = { ...s.newMark }
+  if (u?.firstUnreadId) newMark[channelId] = { firstUnreadId: u.firstUnreadId, count: u.count }
+  else delete newMark[channelId]
+  setApp({ newMark })
+  markChannelRead(channelId)
+}
+
+/** Убирает черту «новые сообщения» (человек долистал до неё или нажал кнопку). */
+export function dismissNewMark(channelId: string): void {
+  if (!getApp().newMark[channelId]) return
   setApp((s) => {
+    const rest = { ...s.newMark }
+    delete rest[channelId]
+    return { newMark: rest }
+  })
+}
+
+const readTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+/**
+ * Отмечает канал прочитанным: локально сразу, серверу — с небольшой задержкой (не чаще раза в секунду).
+ * messageId — до какого сообщения; по умолчанию до последнего загруженного.
+ */
+export function markChannelRead(channelId: string, messageId?: number): void {
+  const s = getApp()
+  const items = s.messages[channelId]?.items ?? []
+  const upTo = messageId ?? items[items.length - 1]?.id
+  if (s.unread[channelId]) {
     const rest = { ...s.unread }
     delete rest[channelId]
-    return { unread: rest }
-  })
+    setApp({ unread: rest })
+  }
+  if (!upTo || !client) return
+  if (readTimers.has(channelId)) return
+  readTimers.set(
+    channelId,
+    setTimeout(() => {
+      readTimers.delete(channelId)
+      const latest = getApp().messages[channelId]?.items.at(-1)?.id ?? upTo
+      client?.request('msg-read', { channelId, messageId: Math.max(upTo, latest) }).catch(() => undefined)
+    }, 800)
+  )
 }
 
 export async function loadHistory(channelId: string): Promise<void> {
@@ -465,31 +566,65 @@ export async function loadHistory(channelId: string): Promise<void> {
       loading: false,
       loaded: true
     }))
+    const s = getApp()
+    if (s.currentChannelId === channelId && s.windowFocused && s.mainView === 'chat') markChannelRead(channelId)
   } catch (err) {
     console.warn('[zvon] не удалось загрузить историю', err)
     patchChannel(channelId, (c) => ({ ...c, loading: false }))
   }
 }
 
-export async function loadOlder(channelId: string): Promise<void> {
-  if (!client) return
+export async function loadOlder(channelId: string): Promise<boolean> {
+  if (!client) return false
   const cur = getApp().messages[channelId]
-  if (!cur || cur.loading || !cur.hasMore || cur.items.length === 0) return
+  if (!cur || cur.loading || !cur.hasMore || cur.items.length === 0) return false
   patchChannel(channelId, (c) => ({ ...c, loading: true }))
   try {
     const res = await client.request('msg-history', { channelId, before: cur.items[0].id, limit: LIMITS.historyPage })
     patchChannel(channelId, (c) => ({ ...c, items: mergeMessages(res.messages, c.items), hasMore: res.hasMore, loading: false }))
+    return res.messages.length > 0
   } catch (err) {
     console.warn('[zvon] не удалось загрузить старые сообщения', err)
     patchChannel(channelId, (c) => ({ ...c, loading: false }))
+    return false
   }
+}
+
+const MAX_JUMP_PAGES = 40
+
+/**
+ * Показать сообщение: открыть его канал, догрузить историю до него и прокрутить с подсветкой.
+ * Возвращает false, если сообщение слишком далеко или уже удалено.
+ */
+export async function jumpToMessage(channelId: string, messageId: number): Promise<boolean> {
+  const s = getApp()
+  if (!s.channels.some((c) => c.id === channelId)) return false
+  if (s.currentChannelId !== channelId || s.mainView !== 'chat') selectChannel(channelId)
+  const has = (): boolean => (getApp().messages[channelId]?.items ?? []).some((m) => m.id === messageId)
+  let waited = 0
+  while (!getApp().messages[channelId]?.loaded && waited < 50) {
+    await new Promise((r) => setTimeout(r, 100))
+    waited++
+  }
+  for (let page = 0; !has() && page < MAX_JUMP_PAGES; page++) {
+    const cur = getApp().messages[channelId]
+    if (!cur?.hasMore) break
+    if (cur.loading) {
+      await new Promise((r) => setTimeout(r, 100))
+      continue
+    }
+    if (!(await loadOlder(channelId))) break
+  }
+  if (!has()) return false
+  setApp({ jump: { channelId, messageId, nonce: Date.now() } })
+  return true
 }
 
 function setPending(channelId: string, fn: (list: PendingMessage[]) => PendingMessage[]): void {
   setApp((s) => ({ pending: { ...s.pending, [channelId]: fn(s.pending[channelId] ?? []) } }))
 }
 
-async function deliver(channelId: string, nonce: string, content: string, attachments: FileInfo[]): Promise<void> {
+async function deliver(channelId: string, nonce: string, content: string, attachments: FileInfo[], replyTo: Message | null): Promise<void> {
   if (!client) {
     setPending(channelId, (l) => l.map((p) => (p.nonce === nonce ? { ...p, failed: true } : p)))
     return
@@ -499,7 +634,8 @@ async function deliver(channelId: string, nonce: string, content: string, attach
       channelId,
       content,
       nonce,
-      attachments: attachments.length ? attachments.map((a) => a.id) : undefined
+      attachments: attachments.length ? attachments.map((a) => a.id) : undefined,
+      replyTo: replyTo?.id
     })
     setPending(channelId, (l) => l.filter((p) => p.nonce !== nonce))
     patchChannel(channelId, (c) => (c.loaded ? { ...c, items: mergeMessages(c.items, [message]) } : c))
@@ -513,16 +649,28 @@ export function sendMessage(channelId: string, raw: string, attachments: FileInf
   const content = raw.replace(/\s+$/u, '')
   if (!content.trim() && attachments.length === 0) return
   const nonce = randomNonce()
-  setPending(channelId, (l) => [...l, { nonce, channelId, content, attachments, createdAt: Date.now(), failed: false }])
+  const replyTo = getApp().replyTo[channelId] ?? null
+  setPending(channelId, (l) => [...l, { nonce, channelId, content, attachments, replyTo, createdAt: Date.now(), failed: false }])
   lastTypingSent = 0
-  void deliver(channelId, nonce, content, attachments)
+  if (replyTo) setReplyTo(channelId, null)
+  void deliver(channelId, nonce, content, attachments, replyTo)
+}
+
+/** Отвечать на сообщение (null — отменить ответ). */
+export function setReplyTo(channelId: string, message: Message | null): void {
+  setApp((s) => {
+    const replyTo = { ...s.replyTo }
+    if (message) replyTo[channelId] = message
+    else delete replyTo[channelId]
+    return { replyTo, editingId: message ? null : s.editingId }
+  })
 }
 
 export function retryPending(channelId: string, nonce: string): void {
   const p = getApp().pending[channelId]?.find((x) => x.nonce === nonce)
   if (!p) return
   setPending(channelId, (l) => l.map((x) => (x.nonce === nonce ? { ...x, failed: false } : x)))
-  void deliver(channelId, nonce, p.content, p.attachments)
+  void deliver(channelId, nonce, p.content, p.attachments, p.replyTo)
 }
 
 export function discardPending(channelId: string, nonce: string): void {
@@ -571,8 +719,91 @@ export async function updateNickname(nickname: string): Promise<string | null> {
   return updateProfile(nickname)
 }
 
-/** Запрос к серверу от панели хоста (права проверяет сервер). */
+/* ======================= личные сообщения ======================= */
+
+/** Открыть переписку с участником (канал создаётся сервером при первом обращении). */
+export async function openDm(userId: string): Promise<string | null> {
+  if (!client) return t('conn.lost')
+  try {
+    const { channel } = await client.request('dm-open', { userId })
+    setApp((s) => ({ channels: s.channels.some((c) => c.id === channel.id) ? s.channels : [...s.channels, channel] }))
+    selectChannel(channel.id)
+    return null
+  } catch (err) {
+    return (err as Error).message
+  }
+}
+
+/** Собеседник в личном канале. */
+export function dmPartner(channel: Channel, myId: string | undefined): UserInfo | null {
+  const otherId = channel.members?.find((id) => id !== myId) ?? channel.members?.[0]
+  return otherId ? (getApp().users[otherId] ?? { id: otherId, nickname: '?', avatar: null, online: false, isAdmin: false, status: null, roles: [] }) : null
+}
+
+/* ======================= поиск ======================= */
+
+let searchSeq = 0
+
+export function openSearch(open: boolean): void {
+  setApp((s) => ({ search: open ? { ...s.search, open: true } : { ...EMPTY_SEARCH } }))
+}
+
+export function setSearchScope(currentOnly: boolean): void {
+  setApp((s) => ({ search: { ...s.search, currentOnly } }))
+  void runSearch(getApp().search.query)
+}
+
+export async function runSearch(query: string): Promise<void> {
+  const q = query.trim()
+  const seq = ++searchSeq
+  if (!q) {
+    setApp((s) => ({ search: { ...s.search, query, results: [], hasMore: false, loading: false, error: null } }))
+    return
+  }
+  setApp((s) => ({ search: { ...s.search, query, loading: true, error: null } }))
+  if (!client) return
+  try {
+    const st = getApp()
+    const res = await client.request('msg-search', {
+      query: q.slice(0, LIMITS.searchQueryLength),
+      channelId: st.search.currentOnly && st.currentChannelId ? st.currentChannelId : undefined,
+      limit: LIMITS.searchPage
+    })
+    if (seq !== searchSeq) return
+    setApp((s) => ({ search: { ...s.search, results: res.messages, hasMore: res.hasMore, loading: false } }))
+  } catch (err) {
+    if (seq !== searchSeq) return
+    setApp((s) => ({ search: { ...s.search, loading: false, error: (err as Error).message } }))
+  }
+}
+
+export async function loadMoreSearch(): Promise<void> {
+  const st = getApp().search
+  if (!client || st.loading || !st.hasMore || st.results.length === 0) return
+  const seq = ++searchSeq
+  setApp((s) => ({ search: { ...s.search, loading: true } }))
+  try {
+    const res = await client.request('msg-search', {
+      query: st.query.trim().slice(0, LIMITS.searchQueryLength),
+      channelId: st.currentOnly && getApp().currentChannelId ? getApp().currentChannelId! : undefined,
+      before: st.results[st.results.length - 1].id,
+      limit: LIMITS.searchPage
+    })
+    if (seq !== searchSeq) return
+    setApp((s) => ({ search: { ...s.search, results: [...s.search.results, ...res.messages], hasMore: res.hasMore, loading: false } }))
+  } catch (err) {
+    if (seq !== searchSeq) return
+    setApp((s) => ({ search: { ...s.search, loading: false, error: (err as Error).message } }))
+  }
+}
+
+/** Запрос к серверу от панели хоста и настроек (права проверяет сервер). */
 export function adminRequest<K extends RequestType>(type: K, data: RequestMap[K]): Promise<ResponseMap[K]> {
   if (!client) return Promise.reject(new Error(t('conn.lost')))
   return client.request(type, data)
+}
+
+/** Любой запрос к серверу текущей сессии (для push-подписок и прочего). */
+export function serverRequest<K extends RequestType>(type: K, data: RequestMap[K]): Promise<ResponseMap[K]> {
+  return adminRequest(type, data)
 }

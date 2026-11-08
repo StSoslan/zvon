@@ -1,6 +1,10 @@
 /**
  * Хаб: принимает WebSocket-подключения, проверяет hello, маршрутизирует запросы,
  * рассылает события и отслеживает присутствие пользователей.
+ *
+ * Один участник может быть подключён с нескольких устройств сразу: у каждого своя сессия,
+ * «в сети» он, пока жива хотя бы одна. Голос при этом ведёт только одно устройство —
+ * то, что вошло в голосовой канал последним.
  */
 import { createHash, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
@@ -11,6 +15,7 @@ import type {
   AccountInfo,
   AdminSettings,
   AdminStats,
+  Channel,
   ClientEnvelope,
   EventMap,
   EventType,
@@ -26,6 +31,7 @@ import { DUMMY_HASH, hashPassword, verifyPassword } from './accounts'
 import type { StoredAccount, StoredUser, ZvonDb } from './db'
 import type { FileService } from './files'
 import type { Logger } from './logger'
+import { PushService } from './push'
 import { ClientSession, RequestError } from './session'
 import type { SfuService } from './sfu'
 import { VoiceManager } from './voice'
@@ -37,6 +43,7 @@ type Handlers = { [K in RequestType]: Handler<K> }
 const RATE_EXEMPT = new Set<RequestType>([
   'ping',
   'typing',
+  'msg-read',
   'consume',
   'consumer-resume',
   'consumer-pause',
@@ -61,18 +68,24 @@ function escapeRegExp(s: string): string {
 
 const MAX_PASSWORD_FAILS = 10
 const PASSWORD_LOCK_MS = 15 * 60 * 1000
+const PUSH_BODY_MAX = 120
 
 export class Hub {
   private sessions = new Set<ClientSession>()
-  /** Активная сессия каждого вошедшего пользователя. */
-  private byUser = new Map<string, ClientSession>()
-  /** Пользователи, у которых оборвалась связь: ждём переподключения. */
+  /** Живые сессии каждого вошедшего пользователя (несколько устройств). */
+  private byUser = new Map<string, Set<ClientSession>>()
+  /** Сессия, которая ведёт голос пользователя (вошла в голосовой канал). */
+  private voiceOwner = new Map<string, ClientSession>()
+  /** Голос «осиротел» (его сессия оборвалась): ждём переподключения, потом выходим из канала. */
+  private voiceOrphanTimers = new Map<string, NodeJS.Timeout>()
+  /** Пользователи, у которых оборвалась связь на всех устройствах: ждём переподключения. */
   private pendingLeave = new Map<string, { timer: NodeJS.Timeout; nickname: string; isAdmin: boolean }>()
   private nextConnId = 1
   private heartbeat: NodeJS.Timeout | null = null
   private readonly handlers: Handlers
   private closing = false
   readonly voice: VoiceManager
+  readonly push: PushService
   /** Заблокированные хостом до перезапуска сервера: userId → ник. */
   private banned = new Map<string, string>()
   /** Неудачные попытки пароля по IP: после MAX_PASSWORD_FAILS вход с адреса закрыт на PASSWORD_LOCK_MS. */
@@ -91,10 +104,11 @@ export class Hub {
     private log: Logger,
     private onOnlineChange: (count: number) => void
   ) {
+    this.push = new PushService(db, log.child('push'))
     this.voice = new VoiceManager(
       sfu,
       {
-        send: (userId, t, d) => this.byUser.get(userId)?.event(t, d),
+        send: (userId, t, d) => this.voiceOwner.get(userId)?.event(t, d),
         broadcast: (t, d) => this.broadcast(t, d),
         isVoiceChannel: (channelId) => this.db.getChannel(channelId)?.type === 'voice'
       },
@@ -133,13 +147,18 @@ export class Hub {
         admin(() => {
           if (!this.db.getChannel(d.channelId)) throw new RequestError(ErrorCode.NotFound, 'Канал не найден')
           this.db.moveChannel(d.channelId, d.direction)
-          this.broadcast('channels-updated', { channels: this.db.listChannels() })
+          this.broadcastChannels()
           return {}
         })(s),
       'account-list': admin(() => ({ accounts: this.requireAccounts().listAccounts().map((a) => this.accountInfo(a)) })),
       'account-create': (s, d) => admin(() => this.createAccount(d))(s),
       'account-update': (s, d) => admin((self) => this.updateAccount(self, d))(s),
       'account-delete': (s, d) => admin((self) => this.deleteAccount(self, d))(s),
+      'status-presets-set': (s, d) => admin(() => this.setStatusPresets(d))(s),
+      'role-create': (s, d) => admin(() => this.createRole(d))(s),
+      'role-update': (s, d) => admin(() => this.updateRole(d))(s),
+      'role-delete': (s, d) => admin(() => this.deleteRole(d))(s),
+      'role-assign': (s, d) => admin(() => this.assignRole(d))(s),
       'password-change': (s, d) => this.changePassword(s, d),
       hello: (s, d) => this.handleHello(s, d),
       ping: () => ({ time: Date.now() }),
@@ -147,11 +166,24 @@ export class Hub {
       'msg-edit': (s, d) => this.handleEdit(s, d),
       'msg-delete': (s, d) => this.handleDelete(s, d),
       'msg-history': (s, d) => this.handleHistory(s, d),
+      'msg-read': (s, d) => this.handleRead(s, d),
+      'msg-search': (s, d) => this.handleSearch(s, d),
+      'status-set': (s, d) => this.setStatus(s, d),
+      'dm-open': (s, d) => this.openDm(s, d),
+      'push-subscribe': (s, d) => {
+        this.push.subscribe(s.userId!, d.subscription)
+        return {}
+      },
+      'push-unsubscribe': (_s, d) => {
+        this.push.unsubscribe(d.endpoint)
+        return {}
+      },
       'profile-update': (s, d) => this.handleProfile(s, d),
       typing: (s, d) => this.handleTyping(s, d),
-      'voice-join': (s, d) => v.join(s.userId!, d),
+      'voice-join': (s, d) => this.voiceJoin(s, d),
       'voice-ready': (s, d) => v.ready(s.userId!, d),
       'voice-leave': (s) => {
+        if (this.voiceOwner.get(s.userId!) === s) this.voiceOwner.delete(s.userId!)
         v.leave(s.userId!)
         return {}
       },
@@ -283,13 +315,36 @@ export class Hub {
     if (s.helloTimer) clearTimeout(s.helloTimer)
     this.log.info(`Отключение ${s.label}, код ${code}`)
     const userId = s.userId
-    if (!userId || this.byUser.get(userId) !== s) return
+    if (!userId) return
+    const set = this.byUser.get(userId)
+    if (!set?.has(s)) return
+    set.delete(s)
+
+    // Голос вело это устройство: даём ему время переподключиться, потом выходим из канала.
+    if (this.voiceOwner.get(userId) === s) {
+      const timer = setTimeout(() => {
+        this.voiceOrphanTimers.delete(userId)
+        if (this.voiceOwner.get(userId) === s) {
+          this.voiceOwner.delete(userId)
+          this.voice.leave(userId)
+        }
+      }, TIMINGS.reconnectGraceMs)
+      this.voiceOrphanTimers.set(userId, timer)
+    }
+
+    if (set.size > 0) {
+      // Другие устройства всё ещё в сети — для остальных ничего не изменилось.
+      this.log.info(`${s.nickname}: осталось устройств в сети — ${set.size}`)
+      return
+    }
     this.byUser.delete(userId)
 
     // Намеренный выход — сразу; обрыв — даём время переподключиться.
     const graceful = code === CloseCode.Normal || code === CloseCode.Kicked || this.closing
     const finish = (): void => {
       this.pendingLeave.delete(userId)
+      this.clearVoiceOrphan(userId)
+      this.voiceOwner.delete(userId)
       this.voice.leave(userId)
       try {
         this.db.touchUser(userId)
@@ -306,6 +361,12 @@ export class Hub {
       const timer = setTimeout(finish, TIMINGS.reconnectGraceMs)
       this.pendingLeave.set(userId, { timer, nickname: s.nickname, isAdmin: s.isAdmin })
     }
+  }
+
+  private clearVoiceOrphan(userId: string): void {
+    const t = this.voiceOrphanTimers.get(userId)
+    if (t) clearTimeout(t)
+    this.voiceOrphanTimers.delete(userId)
   }
 
   private checkAlive(): void {
@@ -326,9 +387,36 @@ export class Hub {
 
   /* ======================= рассылка ======================= */
 
+  private sessionsOf(userId: string): Iterable<ClientSession> {
+    return this.byUser.get(userId) ?? []
+  }
+
   broadcast<E extends EventType>(t: E, d: EventMap[E], except?: ClientSession): void {
-    for (const s of this.byUser.values()) {
-      if (s !== except) s.event(t, d)
+    for (const set of this.byUser.values()) {
+      for (const s of set) if (s !== except) s.event(t, d)
+    }
+  }
+
+  /** Событие всем устройствам одного участника. */
+  private sendToUser<E extends EventType>(userId: string, t: E, d: EventMap[E], except?: ClientSession): void {
+    for (const s of this.sessionsOf(userId)) if (s !== except) s.event(t, d)
+  }
+
+  /** Событие тем, кто видит канал: всем для общего канала, двум участникам — для личного. */
+  private sendToChannel<E extends EventType>(channel: Channel, t: E, d: EventMap[E], except?: ClientSession): void {
+    if (channel.type !== 'dm') {
+      this.broadcast(t, d, except)
+      return
+    }
+    for (const userId of channel.members ?? []) this.sendToUser(userId, t, d, except)
+  }
+
+  /** Список каналов у каждого свой (личные каналы) — рассылаем поимённо. */
+  private broadcastChannels(): void {
+    const shared = this.db.listChannels()
+    for (const [userId, set] of this.byUser) {
+      const channels = [...shared, ...this.db.listDmChannels(userId)]
+      for (const s of set) s.event('channels-updated', { channels })
     }
   }
 
@@ -338,6 +426,8 @@ export class Hub {
     if (this.heartbeat) clearInterval(this.heartbeat)
     for (const p of this.pendingLeave.values()) clearTimeout(p.timer)
     this.pendingLeave.clear()
+    for (const t of this.voiceOrphanTimers.values()) clearTimeout(t)
+    this.voiceOrphanTimers.clear()
     this.voice.closeAll()
     this.broadcast('server-closing', { reason })
     for (const s of this.sessions) s.close(CloseCode.ServerShutdown, 'server shutdown')
@@ -350,16 +440,19 @@ export class Hub {
   }
 
   private isAdminUser(userId: string): boolean {
-    return this.byUser.get(userId)?.isAdmin ?? this.pendingLeave.get(userId)?.isAdmin ?? false
+    for (const s of this.sessionsOf(userId)) return s.isAdmin
+    return this.pendingLeave.get(userId)?.isAdmin ?? this.db.getAccount(userId)?.isAdmin ?? false
   }
 
-  private toUserInfo(u: StoredUser): UserInfo {
+  private toUserInfo(u: StoredUser, roles?: Map<string, string[]>): UserInfo {
     return {
       id: u.id,
       nickname: u.nickname,
       avatar: u.avatar,
       online: this.isOnline(u.id),
-      isAdmin: this.isAdminUser(u.id)
+      isAdmin: this.isAdminUser(u.id),
+      status: u.status,
+      roles: roles ? (roles.get(u.id) ?? []) : this.db.rolesOf(u.id)
     }
   }
 
@@ -372,7 +465,7 @@ export class Hub {
   /** Делает ник уникальным среди тех, кто сейчас в сети: «Вася» → «Вася (2)». */
   private uniqueNickname(wanted: string, selfId: string): string {
     const taken = new Set<string>()
-    for (const [id, s] of this.byUser) if (id !== selfId) taken.add(s.nickname.toLowerCase())
+    for (const [id, set] of this.byUser) if (id !== selfId) for (const s of set) taken.add(s.nickname.toLowerCase())
     for (const [id, p] of this.pendingLeave) if (id !== selfId) taken.add(p.nickname.toLowerCase())
     if (!taken.has(wanted.toLowerCase())) return wanted
     for (let i = 2; i < 100; i++) {
@@ -384,13 +477,19 @@ export class Hub {
   }
 
   private snapshot(s: ClientSession): ServerSnapshot {
-    const users = this.db.listUsers(200, this.accountsMode).map((u) => this.toUserInfo(u))
+    const roles = this.db.rolesOfAll()
+    const users = this.db.listUsers(200, this.accountsMode).map((u) => this.toUserInfo(u, roles))
+    const channels = this.db.channelsFor(s.userId!)
     return {
       serverName: this.cfg.serverName,
       serverVersion: this.cfg.version,
-      channels: this.db.listChannels(),
+      channels,
       users,
       you: this.userInfo(s.userId!),
+      roles: this.db.listRoles(),
+      statusPresets: this.db.statusPresets(),
+      unread: this.db.unreadFor(s.userId!, channels),
+      pushKey: this.push.publicKey,
       voiceStates: this.voice.states(),
       voiceError: this.sfu.error,
       fileToken: s.fileToken,
@@ -483,23 +582,13 @@ export class Hub {
     const userId = account?.id ?? d.clientId
     const isAdmin = Boolean(account?.isAdmin || (this.cfg.adminToken && d.adminToken && secretEquals(d.adminToken, this.cfg.adminToken)))
 
-    // Тот же пользователь уже подключён (например, второе окно или «зависший» сокет) — вытесняем старое.
-    const previous = this.byUser.get(userId)
-    if (previous && previous !== s) {
-      this.log.info(`${previous.label} вытеснен новым подключением`)
-      this.byUser.delete(userId)
-      previous.userId = null
-      previous.close(CloseCode.Replaced, 'replaced')
-    }
+    const others = this.byUser.get(userId)
     const pending = this.pendingLeave.get(userId)
     if (pending) {
       clearTimeout(pending.timer)
       this.pendingLeave.delete(userId)
     }
-    const returning = Boolean(previous || pending)
-    // Медиа старого подключения уже не восстановить без нового сигналинга:
-    // закрываем его, клиент сам заново войдёт в голос, если был там.
-    if (returning) this.voice.leave(userId)
+    const returning = Boolean(others?.size || pending)
 
     // Ник аккаунта уникален (проверяется при смене), остальным уникальность обеспечиваем суффиксом.
     const nickname = account ? account.nickname : this.uniqueNickname(d.nickname, userId)
@@ -512,21 +601,40 @@ export class Hub {
       clearTimeout(s.helloTimer)
       s.helloTimer = null
     }
-    this.byUser.set(userId, s)
+    if (others) others.add(s)
+    else this.byUser.set(userId, new Set([s]))
 
     const info = this.userInfo(userId)
     if (returning) this.broadcast('user-updated', { user: info }, s)
     else this.broadcast('user-joined', { user: info }, s)
     this.onOnlineChange(this.onlineCount)
-    this.log.info(`${s.label} вошёл(а)${isAdmin ? ' как администратор' : ''}${returning ? ' (переподключение)' : ''}`)
+    const devices = this.byUser.get(userId)!.size
+    this.log.info(
+      `${s.label} вошёл(а)${isAdmin ? ' как администратор' : ''}${returning ? ' (переподключение)' : ''}${devices > 1 ? `, устройств: ${devices}` : ''}`
+    )
 
     return this.snapshot(s)
   }
 
-  private requireTextChannel(channelId: string): void {
+  /** Голос ведёт то устройство, которое вошло в канал последним; остальные устройства участника из голоса выходят. */
+  private async voiceJoin(s: ClientSession, d: RequestMap['voice-join']): Promise<ResponseMap['voice-join']> {
+    const userId = s.userId!
+    const owner = this.voiceOwner.get(userId)
+    this.clearVoiceOrphan(userId)
+    if (owner && owner !== s && this.sessions.has(owner)) {
+      owner.event('voice-taken', { reason: 'Вы вошли в голосовой канал с другого устройства' })
+    }
+    this.voiceOwner.set(userId, s)
+    return this.voice.join(userId, d)
+  }
+
+  /** Канал, в который участник может писать и читать: общий текстовый или свой личный. */
+  private textChannelFor(channelId: string, userId: string): Channel {
     const ch = this.db.getChannel(channelId)
     if (!ch) throw new RequestError(ErrorCode.NotFound, 'Канал не найден')
-    if (ch.type !== 'text') throw new RequestError(ErrorCode.BadRequest, 'Это не текстовый канал')
+    if (ch.type === 'voice') throw new RequestError(ErrorCode.BadRequest, 'Это не текстовый канал')
+    if (ch.type === 'dm' && !ch.members?.includes(userId)) throw new RequestError(ErrorCode.Forbidden, 'Это чужая переписка')
+    return ch
   }
 
   /** Находит упоминания @ник и @everyone/@все в тексте. */
@@ -549,17 +657,24 @@ export class Hub {
   }
 
   private handleSend(s: ClientSession, d: RequestMap['msg-send']): ResponseMap['msg-send'] {
-    this.requireTextChannel(d.channelId)
+    const channel = this.textChannelFor(d.channelId, s.userId!)
     const content = d.content.replace(/\s+$/u, '')
+    let replyTo: number | null = null
+    if (d.replyTo) {
+      const original = this.db.getMessage(d.replyTo)
+      if (!original || original.channelId !== channel.id) throw new RequestError(ErrorCode.NotFound, 'Сообщение, на которое вы отвечаете, не найдено')
+      replyTo = original.id
+    }
     let message: Message
     try {
       message = this.db.insertMessage(
         {
-          channelId: d.channelId,
+          channelId: channel.id,
           authorId: s.userId!,
           authorName: s.nickname,
           content,
           mentions: this.extractMentions(content),
+          replyTo,
           createdAt: Date.now()
         },
         [...new Set(d.attachments ?? [])]
@@ -570,37 +685,111 @@ export class Hub {
       }
       throw err
     }
-    this.broadcast('msg-new', { message }, s)
+    // Своё сообщение прочитано: другие устройства автора не должны увидеть его непрочитанным.
+    this.db.markRead(s.userId!, channel.id, message.id)
+    this.sendToUser(s.userId!, 'channel-read', { channelId: channel.id, lastReadId: message.id }, s)
+    this.sendToChannel(channel, 'msg-new', { message }, s)
+    this.notifyPush(channel, message)
     return { message: { ...message, nonce: d.nonce } }
+  }
+
+  /** Push тем, кого сообщение касается лично: собеседнику в личке, упомянутым и автору исходного сообщения. */
+  private notifyPush(channel: Channel, message: Message): void {
+    if (!this.push.publicKey) return
+    const targets = new Set<string>()
+    if (channel.type === 'dm') for (const id of channel.members ?? []) targets.add(id)
+    else {
+      for (const id of message.mentions) {
+        if (id === 'everyone') for (const u of this.db.listUsers(200, this.accountsMode)) targets.add(u.id)
+        else targets.add(id)
+      }
+      if (message.replyTo && !message.replyTo.deleted) targets.add(message.replyTo.authorId)
+    }
+    targets.delete(message.authorId)
+    if (targets.size === 0) return
+    const body = message.content.trim()
+      ? message.content.length > PUSH_BODY_MAX
+        ? `${message.content.slice(0, PUSH_BODY_MAX)}…`
+        : message.content
+      : message.attachments.length === 1
+        ? `📎 ${message.attachments[0].name}`
+        : `📎 Файлов: ${message.attachments.length}`
+    const title = channel.type === 'dm' ? message.authorName : `${message.authorName} в #${channel.name}`
+    this.push.notify([...targets], { title, body, channelId: channel.id, messageId: message.id, tag: `zvon-${channel.id}` })
   }
 
   private handleEdit(s: ClientSession, d: RequestMap['msg-edit']): ResponseMap['msg-edit'] {
     const existing = this.db.getMessage(d.messageId)
     if (!existing) throw new RequestError(ErrorCode.NotFound, 'Сообщение не найдено')
     if (existing.authorId !== s.userId) throw new RequestError(ErrorCode.Forbidden, 'Можно редактировать только свои сообщения')
+    const channel = this.textChannelFor(existing.channelId, s.userId!)
     const content = d.content.replace(/\s+$/u, '')
     const message = this.db.updateMessage(d.messageId, content, this.extractMentions(content))
     if (!message) throw new RequestError(ErrorCode.NotFound, 'Сообщение не найдено')
-    this.broadcast('msg-updated', { message }, s)
+    this.sendToChannel(channel, 'msg-updated', { message }, s)
     return { message }
   }
 
   private handleDelete(s: ClientSession, d: RequestMap['msg-delete']): ResponseMap['msg-delete'] {
     const existing = this.db.getMessage(d.messageId)
     if (!existing) throw new RequestError(ErrorCode.NotFound, 'Сообщение не найдено')
-    if (existing.authorId !== s.userId && !s.isAdmin) {
+    const channel = this.db.getChannel(existing.channelId)
+    const own = existing.authorId === s.userId
+    // В личной переписке администратор чужое не удаляет.
+    if (!own && (!s.isAdmin || channel?.type === 'dm')) {
       throw new RequestError(ErrorCode.Forbidden, 'Можно удалять только свои сообщения')
     }
     this.files.removeFromDisk(this.db.deleteMessage(d.messageId))
-    this.broadcast('msg-deleted', { messageId: d.messageId, channelId: existing.channelId }, s)
+    if (channel) this.sendToChannel(channel, 'msg-deleted', { messageId: d.messageId, channelId: existing.channelId }, s)
     this.log.info(`${s.label} удалил(а) сообщение ${d.messageId}`)
     return { messageId: d.messageId }
   }
 
-  private handleHistory(_s: ClientSession, d: RequestMap['msg-history']): ResponseMap['msg-history'] {
-    this.requireTextChannel(d.channelId)
+  private handleHistory(s: ClientSession, d: RequestMap['msg-history']): ResponseMap['msg-history'] {
+    this.textChannelFor(d.channelId, s.userId!)
     const page = this.db.history(d.channelId, d.before, d.limit ?? LIMITS.historyPage)
     return { channelId: d.channelId, ...page }
+  }
+
+  private handleRead(s: ClientSession, d: RequestMap['msg-read']): ResponseMap['msg-read'] {
+    this.textChannelFor(d.channelId, s.userId!)
+    const before = this.db.lastReadId(s.userId!, d.channelId)
+    const lastReadId = this.db.markRead(s.userId!, d.channelId, d.messageId)
+    if (lastReadId !== before) this.sendToUser(s.userId!, 'channel-read', { channelId: d.channelId, lastReadId }, s)
+    return {}
+  }
+
+  private handleSearch(s: ClientSession, d: RequestMap['msg-search']): ResponseMap['msg-search'] {
+    const visible = this.db.channelsFor(s.userId!).filter((c) => c.type !== 'voice')
+    const channels = d.channelId ? visible.filter((c) => c.id === d.channelId) : visible
+    if (d.channelId && channels.length === 0) throw new RequestError(ErrorCode.NotFound, 'Канал не найден')
+    return this.db.search(
+      d.query,
+      channels.map((c) => c.id),
+      d.before,
+      d.limit ?? LIMITS.searchPage
+    )
+  }
+
+  private setStatus(s: ClientSession, d: RequestMap['status-set']): ResponseMap['status-set'] {
+    this.db.setUserStatus(s.userId!, d.text)
+    const user = this.userInfo(s.userId!)
+    this.broadcast('user-updated', { user }, s)
+    return { user }
+  }
+
+  private openDm(s: ClientSession, d: RequestMap['dm-open']): ResponseMap['dm-open'] {
+    if (d.userId === s.userId) throw new RequestError(ErrorCode.BadRequest, 'Это вы сами')
+    if (!this.db.getUser(d.userId)) throw new RequestError(ErrorCode.NotFound, 'Пользователь не найден')
+    const { channel, created } = this.db.openDm(s.userId!, d.userId)
+    if (created) {
+      // Обоим участникам — свежие списки каналов (у каждого появился новый личный канал).
+      for (const userId of channel.members ?? []) {
+        const channels = this.db.channelsFor(userId)
+        this.sendToUser(userId, 'channels-updated', { channels })
+      }
+    }
+    return { channel }
   }
 
   private handleProfile(s: ClientSession, d: RequestMap['profile-update']): ResponseMap['profile-update'] {
@@ -622,7 +811,7 @@ export class Hub {
       nickname = this.uniqueNickname(d.nickname, s.userId!)
     }
     this.db.upsertUser(s.userId!, nickname)
-    s.nickname = nickname
+    for (const other of this.sessionsOf(s.userId!)) other.nickname = nickname
     const user = this.userInfo(s.userId!)
     this.broadcast('user-updated', { user }, s)
     return { user }
@@ -633,21 +822,24 @@ export class Hub {
   private async adminStats(): Promise<AdminStats> {
     const [sfuStats, voiceStats] = await Promise.all([this.sfu.stats(), this.voice.userStats()])
     const counts = this.voice.counts()
-    const users = [...this.byUser.values()].map((s) => {
-      const vs = voiceStats.get(s.userId!)
-      return {
-        userId: s.userId!,
-        nickname: s.nickname,
-        ip: s.remoteAddress,
-        isAdmin: s.isAdmin,
-        voiceChannelId: this.voice.channelOf(s.userId!),
-        sendKbps: vs?.sendKbps ?? 0,
-        recvKbps: vs?.recvKbps ?? 0,
-        producers: vs?.producers ?? 0,
-        consumers: vs?.consumers ?? 0,
-        connectedAt: s.connectedAt
-      }
-    })
+    const users = [...this.sessions]
+      .filter((s) => s.authenticated)
+      .map((s) => {
+        const isVoice = this.voiceOwner.get(s.userId!) === s
+        const vs = isVoice ? voiceStats.get(s.userId!) : undefined
+        return {
+          userId: s.userId!,
+          nickname: s.nickname,
+          ip: s.remoteAddress,
+          isAdmin: s.isAdmin,
+          voiceChannelId: isVoice ? this.voice.channelOf(s.userId!) : null,
+          sendKbps: vs?.sendKbps ?? 0,
+          recvKbps: vs?.recvKbps ?? 0,
+          producers: vs?.producers ?? 0,
+          consumers: vs?.consumers ?? 0,
+          connectedAt: s.connectedAt
+        }
+      })
     return {
       uptimeSec: Math.round((Date.now() - this.startedAt) / 1000),
       memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
@@ -686,6 +878,56 @@ export class Hub {
     this.onSettingsChanged(next)
     this.log.info(`Хост изменил настройки: ${JSON.stringify(next)}`)
     return { settings: { ...next } }
+  }
+
+  private setStatusPresets(d: RequestMap['status-presets-set']): ResponseMap['status-presets-set'] {
+    const presets = [...new Set(d.presets.map((p) => p.trim()).filter(Boolean))]
+    this.db.setStatusPresets(presets)
+    this.broadcast('status-presets', { presets })
+    return { presets }
+  }
+
+  /* ======================= роли ======================= */
+
+  private rolesEvent(): void {
+    this.broadcast('roles-updated', { roles: this.db.listRoles() })
+  }
+
+  private createRole(d: RequestMap['role-create']): ResponseMap['role-create'] {
+    if (this.db.listRoles().length >= LIMITS.rolesMax) throw new RequestError(ErrorCode.Forbidden, `Слишком много ролей (максимум ${LIMITS.rolesMax})`)
+    const role = this.db.createRole(d.name, d.color.toLowerCase())
+    this.rolesEvent()
+    this.log.info(`Создана роль «${role.name}»`)
+    return { role }
+  }
+
+  private updateRole(d: RequestMap['role-update']): ResponseMap['role-update'] {
+    const role = this.db.updateRole(d.roleId, { name: d.name, color: d.color?.toLowerCase() })
+    if (!role) throw new RequestError(ErrorCode.NotFound, 'Роль не найдена')
+    this.rolesEvent()
+    return { role }
+  }
+
+  private deleteRole(d: RequestMap['role-delete']): ResponseMap['role-delete'] {
+    const role = this.db.getRole(d.roleId)
+    if (!role) throw new RequestError(ErrorCode.NotFound, 'Роль не найдена')
+    const affected = this.db.deleteRole(d.roleId)
+    this.rolesEvent()
+    for (const userId of affected) {
+      const u = this.db.getUser(userId)
+      if (u) this.broadcast('user-updated', { user: this.toUserInfo(u) })
+    }
+    this.log.info(`Роль «${role.name}» удалена`)
+    return {}
+  }
+
+  private assignRole(d: RequestMap['role-assign']): ResponseMap['role-assign'] {
+    if (!this.db.getRole(d.roleId)) throw new RequestError(ErrorCode.NotFound, 'Роль не найдена')
+    if (!this.db.getUser(d.userId)) throw new RequestError(ErrorCode.NotFound, 'Пользователь не найден')
+    this.db.assignRole(d.userId, d.roleId, d.assigned)
+    const user = this.userInfo(d.userId)
+    this.broadcast('user-updated', { user })
+    return { user }
   }
 
   /* ======================= аккаунты ======================= */
@@ -737,12 +979,9 @@ export class Hub {
       disabled: d.disabled
     })!
     if (d.disabled === true) this.forceDisconnect(account.id, 'Администратор отключил ваш аккаунт', 'disabled')
-    else if (d.isAdmin !== undefined && d.isAdmin !== before.isAdmin) {
-      const live = this.byUser.get(account.id)
-      if (live) {
-        // Права меняются со следующего входа: переподключаем, чтобы клиент получил новые.
-        this.forceDisconnect(account.id, d.isAdmin ? 'Вам выданы права администратора — войдите снова' : 'Права администратора сняты — войдите снова', 'kicked')
-      }
+    else if (d.isAdmin !== undefined && d.isAdmin !== before.isAdmin && this.byUser.has(account.id)) {
+      // Права меняются со следующего входа: переподключаем, чтобы клиент получил новые.
+      this.forceDisconnect(account.id, d.isAdmin ? 'Вам выданы права администратора — войдите снова' : 'Права администратора сняты — войдите снова', 'kicked')
     }
     this.log.info(`Аккаунт «${account.login}» изменён администратором`)
     return { account: this.accountInfo(account) }
@@ -760,16 +999,19 @@ export class Hub {
     return {}
   }
 
-  /** Отключает пользователя (и убирает ожидание переподключения). */
+  /** Отключает все устройства пользователя (и убирает ожидание переподключения). */
   private forceDisconnect(userId: string, reason: string, closeReason: string): void {
-    const target = this.byUser.get(userId)
+    const targets = [...this.sessionsOf(userId)]
     const pending = this.pendingLeave.get(userId)
-    if (target) {
+    for (const target of targets) {
       target.event('server-closing', { reason })
       target.close(CloseCode.Kicked, closeReason)
-    } else if (pending) {
+    }
+    if (targets.length === 0 && pending) {
       clearTimeout(pending.timer)
       this.pendingLeave.delete(userId)
+      this.clearVoiceOrphan(userId)
+      this.voiceOwner.delete(userId)
       this.voice.leave(userId)
       this.broadcast('user-left', { userId })
       this.onOnlineChange(this.onlineCount)
@@ -778,21 +1020,11 @@ export class Hub {
 
   private kick(self: ClientSession, d: RequestMap['admin-kick']): Record<string, never> {
     if (d.userId === self.userId) throw new RequestError(ErrorCode.BadRequest, 'Нельзя отключить самого себя')
-    const target = this.byUser.get(d.userId)
+    const targets = [...this.sessionsOf(d.userId)]
     const pending = this.pendingLeave.get(d.userId)
-    if (!target && !pending && !d.ban) throw new RequestError(ErrorCode.NotFound, 'Пользователь не в сети')
-    if (d.ban) this.banned.set(d.userId, target?.nickname ?? pending?.nickname ?? this.db.getUser(d.userId)?.nickname ?? '?')
-    if (target) {
-      target.event('server-closing', { reason: d.ban ? 'Хост заблокировал вас' : 'Хост отключил вас' })
-      target.close(CloseCode.Kicked, d.ban ? 'banned' : 'kicked')
-    } else if (pending) {
-      // Пользователь уже отвалился и ждёт переподключения — убираем сразу.
-      clearTimeout(pending.timer)
-      this.pendingLeave.delete(d.userId)
-      this.voice.leave(d.userId)
-      this.broadcast('user-left', { userId: d.userId })
-      this.onOnlineChange(this.onlineCount)
-    }
+    if (targets.length === 0 && !pending && !d.ban) throw new RequestError(ErrorCode.NotFound, 'Пользователь не в сети')
+    if (d.ban) this.banned.set(d.userId, targets[0]?.nickname ?? pending?.nickname ?? this.db.getUser(d.userId)?.nickname ?? '?')
+    this.forceDisconnect(d.userId, d.ban ? 'Хост заблокировал вас' : 'Хост отключил вас', d.ban ? 'banned' : 'kicked')
     this.log.info(`Хост ${d.ban ? 'заблокировал' : 'отключил'} ${d.userId}`)
     return {}
   }
@@ -800,26 +1032,27 @@ export class Hub {
   private createChannel(d: RequestMap['channel-create']): ResponseMap['channel-create'] {
     if (this.db.listChannels().length >= 50) throw new RequestError(ErrorCode.Forbidden, 'Слишком много каналов (максимум 50)')
     const channel = this.db.createChannel(d.name, d.type)
-    this.broadcast('channels-updated', { channels: this.db.listChannels() })
+    this.broadcastChannels()
     return { channel }
   }
 
   private renameChannel(d: RequestMap['channel-rename']): ResponseMap['channel-rename'] {
-    const channel = this.db.renameChannel(d.channelId, d.name)
-    if (!channel) throw new RequestError(ErrorCode.NotFound, 'Канал не найден')
-    this.broadcast('channels-updated', { channels: this.db.listChannels() })
+    const existing = this.db.getChannel(d.channelId)
+    if (!existing || existing.type === 'dm') throw new RequestError(ErrorCode.NotFound, 'Канал не найден')
+    const channel = this.db.renameChannel(d.channelId, d.name)!
+    this.broadcastChannels()
     return { channel }
   }
 
   private deleteChannel(d: RequestMap['channel-delete']): Record<string, never> {
     const ch = this.db.getChannel(d.channelId)
-    if (!ch) throw new RequestError(ErrorCode.NotFound, 'Канал не найден')
+    if (!ch || ch.type === 'dm') throw new RequestError(ErrorCode.NotFound, 'Канал не найден')
     if (ch.type === 'text' && this.db.listChannels().filter((c) => c.type === 'text').length <= 1) {
       throw new RequestError(ErrorCode.BadRequest, 'Нельзя удалить последний текстовый канал')
     }
     if (ch.type === 'voice') this.voice.closeChannel(ch.id)
     this.files.removeFromDisk(this.db.deleteChannel(ch.id))
-    this.broadcast('channels-updated', { channels: this.db.listChannels() })
+    this.broadcastChannels()
     this.log.info(`Канал «${ch.name}» удалён`)
     return {}
   }
@@ -829,8 +1062,9 @@ export class Hub {
     // Сервер дополнительно гасит слишком частые события.
     if (now - s.lastTypingAt < TIMINGS.typingThrottleMs / 2) return {}
     s.lastTypingAt = now
-    this.requireTextChannel(d.channelId)
-    this.broadcast('typing', { channelId: d.channelId, userId: s.userId! }, s)
+    const channel = this.textChannelFor(d.channelId, s.userId!)
+    this.sendToChannel(channel, 'typing', { channelId: d.channelId, userId: s.userId! }, s)
     return {}
   }
 }
+

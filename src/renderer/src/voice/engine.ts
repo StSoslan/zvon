@@ -7,7 +7,7 @@
 import { Device, types } from 'mediasoup-client'
 import { BITRATE } from '../../../shared/constants'
 import type { ConsumerInfo, MediaJson, MediaSource, ProducerInfo, RequestMap, RequestType, ResponseMap } from '../../../shared/types'
-import { createDenoisedTrack, type DenoisedTrack } from './denoise'
+import { createDenoisedTrack, denoiseSupported, type DenoisedTrack } from './denoise'
 import { diag, errText } from './diag'
 import { effectiveNoiseMode, SCREEN_PRESETS, type ScreenContent, type ScreenQuality, type VoiceSettings } from './settings'
 
@@ -45,6 +45,8 @@ export interface EngineHooks {
   onMicError(message: string | null): void
   /** Система приглушила микрофон (true) или вернула его (false) — например, телефон отдал звук видео. */
   onMicInterrupted(interrupted: boolean): void
+  /** Какая обработка микрофона реально работает (для настроек). */
+  onMicProcessing(processing: 'dfn' | 'rnnoise' | 'builtin' | 'off' | null): void
   /** Транспорт не восстановился — нужен полный перезаход в канал. */
   onFatalTransport(): void
   onVideos(videos: RemoteVideoView[]): void
@@ -96,6 +98,11 @@ const DENOISE_NOTICE = {
   error: 'Нейросеть шумоподавления дала сбой — работает упрощённый режим',
   overload: 'Процессор не успевает за нейросетью шумоподавления — включён упрощённый режим'
 } as const
+
+/** iPhone и iPad: HTMLMediaElement.volume там только для чтения. */
+const IOS =
+  typeof navigator !== 'undefined' &&
+  (/iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1))
 
 const ICE_RESTART_DELAY_MS = 2_000
 const MAX_ICE_RESTARTS = 3
@@ -388,9 +395,13 @@ export class VoiceEngine {
   private async openMic(): Promise<MediaStreamTrack> {
     const allowed = await window.zvon.ensureMediaAccess('microphone')
     if (!allowed) throw Object.assign(new Error('Нет доступа к микрофону'), { name: 'NotAllowedError' })
-    const ai = effectiveNoiseMode(this.settings()) === 'ai'
+    const mode = effectiveNoiseMode(this.settings())
+    const ai = mode === 'ai'
+    const threshold = this.micThreshold()
+    // Порог чувствительности тоже считает воркер: без нейросети дорожка идёт через него только ради порога.
+    const viaWorker = ai || (threshold !== null && denoiseSupported())
     // С нейросетью встроенное шумоподавление выключаем, чтобы звук не обрабатывался дважды.
-    const constraints = this.audioConstraints(effectiveNoiseMode(this.settings()) === 'standard')
+    const constraints = this.audioConstraints(mode === 'standard')
     let stream: MediaStream
     try {
       stream = await navigator.mediaDevices.getUserMedia({ audio: constraints, video: false })
@@ -410,34 +421,63 @@ export class VoiceEngine {
     this.watchMic(track)
     this.micOpenedAt = Date.now()
     const info = track.getSettings()
-    diag(`микрофон открыт: ${info.sampleRate ?? '?'} Гц, шумоподавление «${effectiveNoiseMode(this.settings())}»`)
-    if (!ai) return track
+    diag(`микрофон открыт: ${info.sampleRate ?? '?'} Гц, шумоподавление «${mode}»${threshold !== null ? `, порог ${threshold} дБ` : ''}`)
+    if (!viaWorker) {
+      this.hooks.onMicProcessing(mode === 'standard' ? 'builtin' : 'off')
+      return track
+    }
     try {
-      const denoise = await createDenoisedTrack(track, {
-        onFallback: (reason) => {
-          diag(`нейросеть шумоподавления отключилась: ${reason}`)
-          if (this.denoise === denoise) this.hooks.onMicError(DENOISE_NOTICE[reason])
-        }
-      })
+      const denoise = await createDenoisedTrack(
+        track,
+        {
+          onFallback: (reason) => {
+            diag(`нейросеть шумоподавления отключилась: ${reason}`)
+            if (this.denoise === denoise) {
+              this.hooks.onMicError(DENOISE_NOTICE[reason])
+              this.hooks.onMicProcessing('rnnoise')
+            }
+          }
+        },
+        { denoise: ai, thresholdDb: threshold }
+      )
       this.denoise = denoise
       // Обработанная дорожка сама не узнаёт, что микрофон отключили, — следим за исходной.
       track.addEventListener('ended', () => {
         if (this.denoise === denoise) void this.restartMic('auto')
       })
-      diag(denoise.engine === 'dfn' ? 'шумоподавление: нейросеть DeepFilterNet работает' : 'шумоподавление: нейросеть не загрузилась, упрощённый режим (RNNoise)')
-      if (denoise.engine !== 'dfn') this.micNotice = DENOISE_NOTICE.load
+      diag(
+        denoise.engine === 'dfn'
+          ? 'шумоподавление: нейросеть DeepFilterNet работает'
+          : denoise.engine === 'rnnoise'
+            ? 'шумоподавление: нейросеть не загрузилась, упрощённый режим (RNNoise)'
+            : 'шумоподавление: только порог чувствительности'
+      )
+      if (ai && denoise.engine !== 'dfn') this.micNotice = DENOISE_NOTICE.load
+      this.hooks.onMicProcessing(denoise.engine === 'none' ? (mode === 'standard' ? 'builtin' : 'off') : denoise.engine)
       return denoise.track
     } catch (err) {
       console.warn('[voice] усиленное шумоподавление недоступно, используется встроенное', err)
       diag(`шумоподавление: усиленное не запустилось (${errText(err)}), работает встроенное`)
       this.micNotice = `Усиленное шумоподавление не запустилось (${(err as Error).message}) — работает обычное`
       await track.applyConstraints(this.audioConstraints(true)).catch(() => undefined)
+      this.hooks.onMicProcessing('builtin')
       return track
     }
   }
 
   /** Предупреждение, которое покажется после успешного запуска микрофона. */
   private micNotice: string | null = null
+
+  /** Порог чувствительности из настроек (дБFS) или null, если «авто». */
+  private micThreshold(): number | null {
+    const v = this.settings().micSensitivity
+    return v < 0 ? v : null
+  }
+
+  /** Чувствительность сменили в настройках — применяем без переоткрытия микрофона. */
+  setMicSensitivity(_value: number): void {
+    this.denoise?.setThreshold(this.micThreshold())
+  }
 
   /** Система приглушила микрофон (track.muted): телефон отдал звук другому приложению или видео. */
   private watchMic(track: MediaStreamTrack): void {
@@ -466,6 +506,7 @@ export class VoiceEngine {
   private stopMicStream(): void {
     this.denoise?.stop()
     this.denoise = null
+    if (this.micStream) this.hooks.onMicProcessing(null)
     this.micStream?.getTracks().forEach((t) => t.stop())
     this.micStream = null
   }
@@ -1144,7 +1185,8 @@ export class VoiceEngine {
    */
   private applyVolume(r: RemoteAudio): void {
     const v = this.volumeOf(r)
-    if (v <= 1) {
+    // На iPhone громкость элемента менять нельзя (всегда 100%) — любая другая громкость идёт через Web Audio.
+    if (v <= 1 && !(IOS && v !== 1)) {
       this.dropBoost(r)
       r.el.volume = v
       r.el.muted = this.deafened

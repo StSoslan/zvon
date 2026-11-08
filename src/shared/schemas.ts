@@ -31,6 +31,19 @@ const login = z
   .string()
   .trim()
   .regex(/^[a-zA-Z0-9._-]{2,32}$/, 'Логин: от 2 до 32 латинских букв, цифр, точек, дефисов или подчёркиваний')
+const statusText = z
+  .string()
+  .trim()
+  .min(1, 'Пустой статус')
+  .max(LIMITS.statusLength, `Статус длиннее ${LIMITS.statusLength} символов`)
+  // eslint-disable-next-line no-control-regex
+  .refine((v) => !/[\u0000-\u001f]/.test(v), 'Недопустимые символы в статусе')
+const roleName = z
+  .string()
+  .trim()
+  .min(1, 'Название роли не может быть пустым')
+  .max(LIMITS.roleNameLength, `Название длиннее ${LIMITS.roleNameLength} символов`)
+const roleColor = z.string().regex(/^#[0-9a-fA-F]{6}$/, 'Цвет в формате #rrggbb')
 const newPassword = z
   .string()
   .min(LIMITS.accountPasswordMin, `Пароль не короче ${LIMITS.accountPasswordMin} символов`)
@@ -56,7 +69,8 @@ export const requestSchemas = {
       channelId: id,
       content: z.string().max(LIMITS.messageLength, `Сообщение длиннее ${LIMITS.messageLength} символов`),
       nonce: z.string().max(64).optional(),
-      attachments: z.array(fileId).max(LIMITS.attachmentsPerMessage, `Не больше ${LIMITS.attachmentsPerMessage} файлов`).optional()
+      attachments: z.array(fileId).max(LIMITS.attachmentsPerMessage, `Не больше ${LIMITS.attachmentsPerMessage} файлов`).optional(),
+      replyTo: z.number().int().positive().optional()
     })
     .refine((m) => m.content.trim().length > 0 || (m.attachments?.length ?? 0) > 0, 'Пустое сообщение'),
   'msg-edit': z.object({ messageId: z.number().int().positive(), content }),
@@ -66,6 +80,27 @@ export const requestSchemas = {
     before: z.number().int().positive().optional(),
     limit: z.number().int().min(1).max(LIMITS.historyPageMax).optional()
   }),
+  'msg-read': z.object({ channelId: id, messageId: z.number().int().positive() }),
+  'msg-search': z.object({
+    query: z.string().trim().min(1, 'Пустой запрос').max(LIMITS.searchQueryLength, 'Слишком длинный запрос'),
+    channelId: id.optional(),
+    before: z.number().int().positive().optional(),
+    limit: z.number().int().min(1).max(LIMITS.searchPage).optional()
+  }),
+  'status-set': z.object({ text: statusText.nullable() }),
+  'dm-open': z.object({ userId: id }),
+  'push-subscribe': z.object({
+    subscription: z.object({
+      endpoint: z.string().url().max(2048),
+      keys: z.object({ p256dh: z.string().min(1).max(256), auth: z.string().min(1).max(256) })
+    })
+  }),
+  'push-unsubscribe': z.object({ endpoint: z.string().max(2048) }),
+  'status-presets-set': z.object({ presets: z.array(statusText).max(LIMITS.statusPresets, `Не больше ${LIMITS.statusPresets} статусов`) }),
+  'role-create': z.object({ name: roleName, color: roleColor }),
+  'role-update': z.object({ roleId: id, name: roleName.optional(), color: roleColor.optional() }),
+  'role-delete': z.object({ roleId: id }),
+  'role-assign': z.object({ userId: id, roleId: id, assigned: z.boolean() }),
   'profile-update': z.object({ nickname, avatar: fileId.nullable().optional() }),
   typing: z.object({ channelId: id }),
 

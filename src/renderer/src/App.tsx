@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { HashIcon, MenuIcon, UsersIcon, VolumeIcon } from './components/Icons'
+import { ChatIcon, HashIcon, MenuIcon, SearchIcon, UsersIcon, VolumeIcon } from './components/Icons'
 import { ChatView } from './components/ChatView'
 import { ConnectScreen } from './components/ConnectScreen'
 import { MemberList } from './components/MemberList'
@@ -7,7 +7,7 @@ import { Sidebar } from './components/Sidebar'
 import { VoiceStage } from './components/VoiceStage'
 import { Lightbox } from './components/Attachments'
 import { useApp } from './store/app'
-import { bootApp, cleanError } from './store/session'
+import { bootApp, cleanError, dmPartner, openSearch } from './store/session'
 
 export function App() {
   const booted = useApp((s) => s.boot !== null)
@@ -56,6 +56,10 @@ export function App() {
 function MobileBar({ stage, onChannels, onMembers }: { stage: boolean; onChannels: () => void; onMembers: () => void }) {
   const channel = useApp((s) => s.channels.find((c) => c.id === (stage ? s.voiceChannelId : s.currentChannelId)))
   const unread = useApp((s) => Object.values(s.unread).some((u) => u.count > 0))
+  const myId = useApp((s) => s.me?.id)
+  const searchOpen = useApp((s) => s.search.open)
+  const isDm = channel?.type === 'dm'
+  const title = isDm ? (dmPartner(channel, myId)?.nickname ?? '?') : (channel?.name ?? 'Zvon')
   return (
     <header className="mobile-bar">
       <button className="icon-btn" onClick={onChannels} aria-label="Каналы">
@@ -63,9 +67,14 @@ function MobileBar({ stage, onChannels, onMembers }: { stage: boolean; onChannel
         {unread && <span className="mobile-dot" />}
       </button>
       <span className="mobile-title">
-        {stage ? <VolumeIcon width={18} height={18} /> : <HashIcon width={18} height={18} />}
-        {channel?.name ?? 'Zvon'}
+        {stage ? <VolumeIcon width={18} height={18} /> : isDm ? <ChatIcon width={18} height={18} /> : <HashIcon width={18} height={18} />}
+        {title}
       </span>
+      {!stage && channel && (
+        <button className={searchOpen ? 'icon-btn active' : 'icon-btn'} onClick={() => openSearch(!searchOpen)} aria-label="Поиск">
+          <SearchIcon width={22} height={22} />
+        </button>
+      )}
       <button className="icon-btn" onClick={onMembers} aria-label="Участники">
         <UsersIcon width={22} height={22} />
       </button>

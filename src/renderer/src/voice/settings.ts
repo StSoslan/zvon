@@ -46,6 +46,13 @@ export interface VoiceSettings {
   /** Громкость звука демонстрации экрана 0…2 (по id ведущего). */
   streamVolumes: Record<string, number>
   sounds: boolean
+  /** Громкость звуков входа/выхода и прочих сигналов, 0…2 (1 — как раньше). */
+  soundVolume: number
+  /**
+   * Чувствительность микрофона: порог в дБFS (−90…−20), тише которого микрофон молчит;
+   * 0 — авто (решает детектор речи или ничего не ограничивать).
+   */
+  micSensitivity: number
   videoInputDeviceId: string
   screenQuality: ScreenQuality
   screenContent: ScreenContent
@@ -71,6 +78,8 @@ export const DEFAULT_VOICE_SETTINGS: VoiceSettings = {
   userVolumes: {},
   streamVolumes: {},
   sounds: true,
+  soundVolume: 1,
+  micSensitivity: 0,
   videoInputDeviceId: '',
   screenQuality: '1080p30',
   screenContent: 'detail',
@@ -128,6 +137,8 @@ export function loadVoiceSettings(): VoiceSettings {
       userVolumes: { ...(parsed.userVolumes ?? {}) },
       streamVolumes: { ...(parsed.streamVolumes ?? {}) },
       mode: parsed.mode === 'ptt' ? 'ptt' : 'voice',
+      soundVolume: typeof parsed.soundVolume === 'number' && Number.isFinite(parsed.soundVolume) ? Math.min(2, Math.max(0, parsed.soundVolume)) : 1,
+      micSensitivity: typeof parsed.micSensitivity === 'number' && Number.isFinite(parsed.micSensitivity) ? Math.min(0, Math.max(-90, parsed.micSensitivity)) : 0,
       screenQuality: parsed.screenQuality && parsed.screenQuality in SCREEN_PRESETS ? parsed.screenQuality : '1080p30',
       screenContent: parsed.screenContent === 'motion' ? 'motion' : 'detail',
       notifyMode: parsed.notifyMode === 'all' || parsed.notifyMode === 'none' ? parsed.notifyMode : 'mentions'

@@ -4,13 +4,16 @@ import { LIMITS } from '../../../shared/constants'
 import type { Channel, UserInfo } from '../../../shared/types'
 import { formatSize } from '../lib/files'
 import { getApp, setApp, useApp, type DraftAttachment } from '../store/app'
-import { notifyTyping, sendMessage } from '../store/session'
+import { dmPartner, notifyTyping, sendMessage, setReplyTo } from '../store/session'
 import { addFiles, draftsBusy, removeDraft, retryDraft, takeReadyAttachments } from '../store/uploads'
 import { Avatar } from './Common'
 import { EmojiPicker } from './EmojiPicker'
-import { CloseIcon, FileIcon, PlusCircleIcon, RetryIcon, SendIcon, SmileIcon } from './Icons'
+import { CloseIcon, FileIcon, PlusCircleIcon, ReplyIcon, RetryIcon, SendIcon, SmileIcon } from './Icons'
 
 const NO_DRAFTS: DraftAttachment[] = []
+
+/** На телефоне поле ввода не берёт фокус само: иначе клавиатура выезжает при каждой смене канала. */
+const TOUCH = typeof window !== 'undefined' && window.matchMedia('(hover: none)').matches
 
 /** Черновики по каналам живут, пока открыто приложение. */
 const drafts = new Map<string, string>()
@@ -35,6 +38,9 @@ export function Composer({ channel, users }: { channel: Channel; users: UserInfo
   const [pickerOpen, setPickerOpen] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
   const attachments = useApp((s) => s.drafts[channel.id]) ?? NO_DRAFTS
+  const replyTo = useApp((s) => s.replyTo[channel.id] ?? null)
+  const usersMap = useApp((s) => s.users)
+  const myId = useApp((s) => s.me?.id)
   const ref = useRef<HTMLTextAreaElement>(null)
   const fileInput = useRef<HTMLInputElement>(null)
   /** Куда поставить курсор после программной вставки (применяется сразу после рендера). */
@@ -53,8 +59,13 @@ export function Composer({ channel, users }: { channel: Channel; users: UserInfo
   useEffect(() => {
     setText(drafts.get(channel.id) ?? '')
     setMention(null)
-    ref.current?.focus()
+    if (!TOUCH) ref.current?.focus()
   }, [channel.id])
+
+  // Нажали «Ответить» — курсор в поле ввода.
+  useEffect(() => {
+    if (replyTo) ref.current?.focus()
+  }, [replyTo])
 
   useEffect(() => {
     drafts.set(channel.id, text)
@@ -160,6 +171,11 @@ export function Composer({ channel, users }: { channel: Channel; users: UserInfo
       submit()
       return
     }
+    if (e.key === 'Escape' && replyTo) {
+      e.preventDefault()
+      setReplyTo(channel.id, null)
+      return
+    }
     // Стрелка вверх в пустом поле — редактировать своё последнее сообщение.
     if (e.key === 'ArrowUp' && !text) {
       const s = getApp()
@@ -173,9 +189,22 @@ export function Composer({ channel, users }: { channel: Channel; users: UserInfo
   }
 
   const tooLong = text.length > LIMITS.messageLength - 200
+  const placeholder = channel.type === 'dm' ? t('chat.placeholderDm', { name: dmPartner(channel, myId)?.nickname ?? '' }) : t('chat.placeholder', { channel: channel.name })
 
   return (
     <div className="composer">
+      {replyTo && (
+        <div className="reply-bar">
+          <ReplyIcon width={16} height={16} />
+          <span className="reply-bar-text">
+            {t('chat.replyingTo')} <b>{usersMap[replyTo.authorId]?.nickname ?? replyTo.authorName}</b>
+            {replyTo.content ? <span className="reply-bar-snippet">: {replyTo.content.replace(/\s+/gu, ' ').slice(0, 120)}</span> : null}
+          </span>
+          <button className="icon-btn" title={t('common.cancel')} onClick={() => setReplyTo(channel.id, null)}>
+            <CloseIcon width={16} height={16} />
+          </button>
+        </div>
+      )}
       {attachments.length > 0 && (
         <div className="drafts">
           {attachments.map((d) => (
@@ -219,7 +248,7 @@ export function Composer({ channel, users }: { channel: Channel; users: UserInfo
           value={text}
           rows={1}
           maxLength={LIMITS.messageLength}
-          placeholder={t('chat.placeholder', { channel: channel.name })}
+          placeholder={placeholder}
           onChange={(e) => {
             setText(e.target.value)
             updateMention(e.target.value, e.target.selectionStart ?? e.target.value.length)

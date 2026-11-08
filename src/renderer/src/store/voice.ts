@@ -22,7 +22,13 @@ let currentClient: ZvonClient | null = null
 const MAX_REJOIN_ATTEMPTS = 8
 
 function sound(name: SoundName): void {
-  if (getApp().voiceSettings.sounds) playSound(name)
+  const s = getApp().voiceSettings
+  if (s.sounds) playSound(name, 0.15 * s.soundVolume)
+}
+
+/** Проиграть звук с текущей громкостью (кнопка «проверить» в настройках). */
+export function previewSound(name: SoundName): void {
+  playSound(name, 0.15 * getApp().voiceSettings.soundVolume)
 }
 
 /* ======================= подключение к сессии ======================= */
@@ -40,6 +46,7 @@ export function attachVoice(client: ZvonClient): void {
       },
       onMicError: (micError) => setApp({ micError }),
       onMicInterrupted,
+      onMicProcessing: (micProcessing) => setApp({ micProcessing }),
       onFatalTransport: () => scheduleRejoin(500),
       onVideos: (remoteVideos) => {
         setApp({ remoteVideos })
@@ -63,6 +70,16 @@ export function attachVoice(client: ZvonClient): void {
     client.on('consumer-closed', ({ consumerId }) => engine?.onConsumerClosed(consumerId)),
     client.on('speaking', ({ channelId, levels }) => setApp((st) => ({ speaking: { ...st.speaking, [channelId]: levels } }))),
     client.on('consumer-layers', ({ consumerId, spatialLayer }) => engine?.onConsumerLayers(consumerId, spatialLayer)),
+    client.on('voice-taken', ({ reason }) => {
+      // Голос перехватило другое устройство этого же участника — здесь тихо выходим.
+      diag(`голос забрало другое устройство: ${reason}`)
+      closeAllPopouts()
+      engine?.closeLocal()
+      setApp({ voiceChannelId: null, voiceStatus: 'idle', voiceError: null, micError: null, mediaError: null, speaking: {}, mainView: 'chat', connNotice: reason })
+      setTimeout(() => {
+        if (getApp().connNotice === reason) setApp({ connNotice: null })
+      }, 8000)
+    }),
     client.on('voice-reset', ({ reason }) => {
       console.warn('[voice] сервер сбросил голос:', reason)
       if (getApp().voiceChannelId) {
@@ -268,8 +285,11 @@ export function updateVoiceSettings(patch: Partial<VoiceSettings>): void {
     prev.inputDeviceId !== next.inputDeviceId ||
     prev.echoCancellation !== next.echoCancellation ||
     prev.noiseMode !== next.noiseMode ||
-    prev.autoGainControl !== next.autoGainControl
+    prev.autoGainControl !== next.autoGainControl ||
+    // Порог включается или выключается — меняется сам способ обработки микрофона.
+    (prev.micSensitivity === 0) !== (next.micSensitivity === 0)
   if (micChanged) void engine?.restartMic()
+  else if (prev.micSensitivity !== next.micSensitivity) engine?.setMicSensitivity(next.micSensitivity)
   if (prev.outputDeviceId !== next.outputDeviceId) {
     void engine?.setOutputDevice(next.outputDeviceId)
     setSoundsOutput(next.outputDeviceId)

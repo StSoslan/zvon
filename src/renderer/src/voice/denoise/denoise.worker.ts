@@ -11,7 +11,14 @@ export interface DenoiseInit {
   writable: WritableStream<AudioData>
   /** Скомпилированный DeepFilterNet и его модель; null — работать только на RNNoise. */
   dfn: { module: WebAssembly.Module; model: Uint8Array } | null
+  /** false — шум не убирать, только порог чувствительности. */
+  denoise: boolean
+  /** Чувствительность микрофона, дБFS; null — авто. */
+  thresholdDb: number | null
 }
+
+/** Команды на ходу (после запуска). */
+export type DenoiseCommand = { type: 'threshold'; db: number | null }
 
 export type DenoiseMessage =
   | { type: 'ready'; engine: DenoiseEngine; note: string | null }
@@ -20,7 +27,7 @@ export type DenoiseMessage =
   | { type: 'error'; message: string }
 
 interface WorkerScope {
-  onmessage: ((e: MessageEvent<DenoiseInit>) => void) | null
+  onmessage: ((e: MessageEvent<DenoiseInit | DenoiseCommand>) => void) | null
   postMessage(message: DenoiseMessage): void
 }
 
@@ -58,20 +65,27 @@ const OVERLOAD_MS = 7
 /** Сколько кадров подряд (≈3 с) усреднять, прежде чем признать перегрузку. */
 const OVERLOAD_WINDOW = 300
 
-ctx.onmessage = async (e: MessageEvent<DenoiseInit>) => {
-  const { readable, writable, dfn } = e.data
+let active: DenoisePipeline | null = null
+
+ctx.onmessage = async (e: MessageEvent<DenoiseInit | DenoiseCommand>) => {
+  if ('type' in e.data) {
+    if (e.data.type === 'threshold') active?.setThreshold(e.data.db)
+    return
+  }
+  const { readable, writable, dfn, denoise, thresholdDb } = e.data
   let pipeline: DenoisePipeline
   let note: string | null = null
   try {
     let filter = null
-    if (dfn) {
+    if (dfn && denoise) {
       try {
         filter = await createDeepFilter(dfn.module, dfn.model)
       } catch (err) {
         note = (err as Error).message
       }
     }
-    pipeline = new DenoisePipeline(filter)
+    pipeline = new DenoisePipeline(filter, { denoise, thresholdDb })
+    active = pipeline
   } catch (err) {
     ctx.postMessage({ type: 'error', message: (err as Error).message })
     return

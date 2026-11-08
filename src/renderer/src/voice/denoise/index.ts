@@ -4,7 +4,7 @@
  * Файлы нейросети (≈22 МБ) загружаются только при первом включении и переиспользуются.
  */
 import DenoiseWorker from './denoise.worker?worker&inline'
-import type { DenoiseInit, DenoiseMessage } from './denoise.worker'
+import type { DenoiseCommand, DenoiseInit, DenoiseMessage } from './denoise.worker'
 import dfnModelUrl from './dfn/DeepFilterNet3_onnx.tar.gz?url'
 import dfnWasmUrl from './dfn/df_bg.wasm?url'
 import type { DenoiseEngine } from './pipeline'
@@ -20,9 +20,17 @@ declare class MediaStreamTrackGenerator extends MediaStreamTrack {
 
 export interface DenoisedTrack {
   track: MediaStreamTrack
-  /** Что реально работает: dfn — нейросеть DeepFilterNet3, rnnoise — упрощённый режим. */
+  /** Что реально работает: dfn — нейросеть DeepFilterNet3, rnnoise — упрощённый режим, none — только порог. */
   engine: DenoiseEngine
+  /** Сменить чувствительность микрофона на ходу. */
+  setThreshold(db: number | null): void
   stop(): void
+}
+
+export interface DenoiseOptions {
+  /** Убирать шум нейросетью (иначе дорожка идёт через воркер только ради порога чувствительности). */
+  denoise: boolean
+  thresholdDb: number | null
 }
 
 export interface DenoiseHooks {
@@ -94,14 +102,16 @@ export function preloadDenoise(): void {
 }
 
 /** Возвращает очищенную дорожку; при ошибке бросает исключение (вызывающий оставляет исходную). */
-export async function createDenoisedTrack(source: MediaStreamTrack, hooks: DenoiseHooks): Promise<DenoisedTrack> {
+export async function createDenoisedTrack(source: MediaStreamTrack, hooks: DenoiseHooks, options: DenoiseOptions): Promise<DenoisedTrack> {
   if (!denoiseSupported()) throw new Error('Insertable Streams недоступны')
 
   let dfn: DfnAssets | null = null
-  try {
-    dfn = await loadDfn()
-  } catch (err) {
-    console.warn('[voice] DeepFilterNet не загрузился, шумоподавление работает на RNNoise', err)
+  if (options.denoise) {
+    try {
+      dfn = await loadDfn()
+    } catch (err) {
+      console.warn('[voice] DeepFilterNet не загрузился, шумоподавление работает на RNNoise', err)
+    }
   }
 
   const processor = new MediaStreamTrackProcessor({ track: source })
@@ -130,7 +140,7 @@ export async function createDenoisedTrack(source: MediaStreamTrack, hooks: Denoi
         clearTimeout(timer)
         reject(new Error(e.message || 'ошибка воркера шумоподавления'))
       }
-      const init: DenoiseInit = { readable: processor.readable, writable: generator.writable, dfn }
+      const init: DenoiseInit = { readable: processor.readable, writable: generator.writable, dfn, denoise: options.denoise, thresholdDb: options.thresholdDb }
       worker.postMessage(init, [processor.readable as unknown as Transferable, generator.writable as unknown as Transferable])
     })
   } catch (err) {
@@ -142,6 +152,10 @@ export async function createDenoisedTrack(source: MediaStreamTrack, hooks: Denoi
   return {
     track: generator,
     engine,
+    setThreshold(db) {
+      const cmd: DenoiseCommand = { type: 'threshold', db }
+      worker.postMessage(cmd)
+    },
     stop() {
       worker.terminate()
       generator.stop()

@@ -214,3 +214,31 @@ export const UsersIcon = (p: P) => (
     <path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
   </svg>
 )
+export const ReplyIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M9 17 4 12l5-5" />
+    <path d="M20 18v-2a4 4 0 0 0-4-4H4" />
+  </svg>
+)
+export const SearchIcon = (p: P) => (
+  <svg {...base(p)}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="m20 20-3.5-3.5" />
+  </svg>
+)
+export const ChatIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M21 12a8 8 0 0 1-8 8H7l-4 3V12a8 8 0 0 1 8-8h2a8 8 0 0 1 8 8z" />
+  </svg>
+)
+export const ArrowDownIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M12 5v14M5 12l7 7 7-7" />
+  </svg>
+)
+export const AtIcon = (p: P) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="4" />
+    <path d="M16 12v1.5a2.5 2.5 0 0 0 5 0V12a9 9 0 1 0-3.5 7.1" />
+  </svg>
+)

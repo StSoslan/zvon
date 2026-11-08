@@ -3,11 +3,11 @@ import { useTranslation } from 'react-i18next'
 import { LIMITS } from '../../../shared/constants'
 import { useApp } from '../store/app'
 import { makeAvatar } from '../lib/files'
-import { changePassword, disconnect, selectChannel, updateProfile } from '../store/session'
+import { changePassword, disconnect, dmPartner, selectChannel, setMyStatus, updateProfile } from '../store/session'
 import { Avatar, Modal } from './Common'
 import { HostPanel } from './HostPanel'
 import { HostShare } from './HostShare'
-import { ChevronIcon, EditIcon, HashIcon, LogoutIcon, ServerIcon, UserPlusIcon } from './Icons'
+import { AtIcon, ChevronIcon, CloseIcon, EditIcon, HashIcon, LogoutIcon, ServerIcon, UserPlusIcon } from './Icons'
 import { VoiceChannelItem, VoiceControls, VoicePanel } from './Voice'
 
 export function Sidebar() {
@@ -105,8 +105,11 @@ function ChannelList() {
   const channels = useApp((s) => s.channels)
   const current = useApp((s) => s.currentChannelId)
   const unread = useApp((s) => s.unread)
+  const myId = useApp((s) => s.me?.id)
+  const users = useApp((s) => s.users)
   const text = channels.filter((c) => c.type === 'text')
   const voice = channels.filter((c) => c.type === 'voice')
+  const dms = channels.filter((c) => c.type === 'dm')
 
   return (
     <nav className="channel-list">
@@ -126,6 +129,20 @@ function ChannelList() {
       {voice.map((c) => (
         <VoiceChannelItem key={c.id} channel={c} />
       ))}
+      {dms.length > 0 && <div className="channel-group">{t('chat.directMessages')}</div>}
+      {dms.map((c) => {
+        const partner = dmPartner(c, myId)
+        const u = unread[c.id]
+        const cls = ['channel channel-dm', c.id === current ? 'active' : '', u ? 'unread' : ''].join(' ')
+        const name = partner ? (users[partner.id]?.nickname ?? partner.nickname) : '?'
+        return (
+          <button key={c.id} className={cls} onClick={() => selectChannel(c.id)} title={partner?.status ?? undefined}>
+            {partner && <Avatar id={partner.id} nickname={name} size={22} online={partner.online} />}
+            <span className="channel-name">{name}</span>
+            {u && u.count > 0 && <span className="badge">{u.count}</span>}
+          </button>
+        )
+      })}
     </nav>
   )
 }
@@ -135,21 +152,96 @@ function UserPanel() {
   const me = useApp((s) => s.me)
   const connStatus = useApp((s) => s.connStatus)
   const [editOpen, setEditOpen] = useState(false)
+  const [statusOpen, setStatusOpen] = useState(false)
   if (!me) return null
   return (
     <div className="user-panel">
-      <button className="user-panel-me" title={t('profile.title')} onClick={() => setEditOpen(true)}>
-        <Avatar id={me.id} nickname={me.nickname} size={32} online={connStatus === 'online'} />
+      <div className="user-panel-me">
+        <button className="user-panel-avatar" title={t('profile.title')} onClick={() => setEditOpen(true)}>
+          <Avatar id={me.id} nickname={me.nickname} size={32} online={connStatus === 'online'} />
+        </button>
         <span className="user-panel-name">
-          <span className="name">{me.nickname}</span>
-          <span className="status">
-            {connStatus === 'online' ? 'online' : connStatus}
+          <button className="name" title={t('profile.title')} onClick={() => setEditOpen(true)}>
+            {me.nickname}
             <EditIcon width={11} height={11} className="edit-hint" />
-          </span>
+          </button>
+          <button className={me.status ? 'status has-status' : 'status'} title={t('status.set')} onClick={() => setStatusOpen((v) => !v)}>
+            {me.status ?? (connStatus === 'online' ? t('status.none') : connStatus)}
+          </button>
         </span>
-      </button>
+        {statusOpen && <StatusMenu current={me.status} onClose={() => setStatusOpen(false)} />}
+      </div>
       <VoiceControls />
       {editOpen && <ProfileDialog current={me.nickname} onClose={() => setEditOpen(false)} />}
+    </div>
+  )
+}
+
+/** Выбор статуса: готовые варианты сервера или свой текст. */
+function StatusMenu({ current, onClose }: { current: string | null; onClose: () => void }) {
+  const { t } = useTranslation()
+  const presets = useApp((s) => s.statusPresets)
+  const [text, setText] = useState(current ?? '')
+  const [error, setError] = useState<string | null>(null)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    const onDown = (e: MouseEvent): void => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose()
+    }
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === 'Escape') onClose()
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [onClose])
+
+  const apply = async (value: string | null): Promise<void> => {
+    const err = await setMyStatus(value)
+    if (err) setError(err)
+    else onClose()
+  }
+
+  return (
+    <div className="status-menu" ref={ref}>
+      <div className="status-menu-title">
+        <AtIcon width={16} height={16} />
+        {t('status.set')}
+      </div>
+      {presets.map((p) => (
+        <button key={p} className={p === current ? 'dropdown-item active' : 'dropdown-item'} onClick={() => void apply(p)}>
+          {p}
+        </button>
+      ))}
+      <form
+        className="status-custom"
+        onSubmit={(e) => {
+          e.preventDefault()
+          void apply(text.trim() || null)
+        }}
+      >
+        <input
+          autoFocus
+          value={text}
+          maxLength={LIMITS.statusLength}
+          placeholder={t('status.customPlaceholder')}
+          onChange={(e) => setText(e.target.value)}
+        />
+        <button className="btn btn-small btn-primary" type="submit">
+          {t('common.save')}
+        </button>
+      </form>
+      {current && (
+        <button className="dropdown-item danger" onClick={() => void apply(null)}>
+          <CloseIcon width={14} height={14} />
+          {t('status.clear')}
+        </button>
+      )}
+      {error && <div className="error-box">{error}</div>}
     </div>
   )
 }

@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
-import type { Channel, ChannelType, FileInfo, FileKind, Message } from '../shared/types'
+import { LIMITS } from '../shared/constants'
+import type { Channel, ChannelType, FileInfo, FileKind, Message, PushSubscriptionJson, ReplyRef, Role, UnreadInfo } from '../shared/types'
 import type { Logger } from './logger'
 
 /** Миграции применяются по порядку; номер версии хранится в PRAGMA user_version. */
@@ -67,8 +68,74 @@ const MIGRATIONS: string[] = [
     disabled      INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL
   );
+  `,
+  // Ответы, статусы, роли, личные каналы, прочитанное, push и полнотекстовый поиск.
+  `
+  ALTER TABLE messages ADD COLUMN reply_to INTEGER;
+  ALTER TABLE users ADD COLUMN status TEXT;
+  CREATE TABLE roles (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    color      TEXT NOT NULL,
+    position   INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE TABLE user_roles (
+    user_id TEXT NOT NULL,
+    role_id TEXT NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, role_id)
+  );
+  CREATE TABLE channel_members (
+    channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    user_id    TEXT NOT NULL,
+    PRIMARY KEY (channel_id, user_id)
+  );
+  CREATE INDEX idx_channel_members_user ON channel_members (user_id);
+  CREATE TABLE reads (
+    user_id      TEXT NOT NULL,
+    channel_id   TEXT NOT NULL,
+    last_read_id INTEGER NOT NULL,
+    PRIMARY KEY (user_id, channel_id)
+  );
+  CREATE TABLE push_subscriptions (
+    endpoint   TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL,
+    p256dh     TEXT NOT NULL,
+    auth       TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX idx_push_user ON push_subscriptions (user_id);
+  CREATE VIRTUAL TABLE messages_fts USING fts5(content, content='messages', content_rowid='id', tokenize='unicode61 remove_diacritics 2');
+  INSERT INTO messages_fts(rowid, content) SELECT id, content FROM messages;
+  CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+  END;
+  CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.id, old.content);
+  END;
+  CREATE TRIGGER messages_fts_au AFTER UPDATE OF content ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content) VALUES ('delete', old.id, old.content);
+    INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+  END;
   `
 ]
+
+/** SQLite не умеет менять CHECK-ограничение: тип 'dm' разрешаем, пересоздавая таблицу каналов. */
+const CHANNELS_WITH_DM = `
+  CREATE TABLE channels_new (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    type       TEXT NOT NULL CHECK (type IN ('text', 'voice', 'dm')),
+    position   INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  INSERT INTO channels_new SELECT id, name, type, position, created_at FROM channels;
+  DROP TABLE channels;
+  ALTER TABLE channels_new RENAME TO channels;
+`
+
+/** Готовые статусы, пока администратор не задал свои. */
+export const DEFAULT_STATUS_PRESETS = ['Отошёл', 'Скоро вернусь', 'Не беспокоить', 'На работе', 'Играю']
 
 interface MessageRow {
   id: number
@@ -80,6 +147,7 @@ interface MessageRow {
   created_at: number
   edited_at: number | null
   attachments: string
+  reply_to: number | null
 }
 
 interface FileRow {
@@ -198,10 +266,23 @@ export interface StoredUser {
   id: string
   nickname: string
   avatar: string | null
+  status: string | null
   lastSeen: number
 }
 
-function rowToMessage(r: MessageRow, files: Map<string, StoredFile>): Message {
+interface UserRow {
+  id: string
+  nickname: string
+  avatar: string | null
+  status: string | null
+  last_seen: number
+}
+
+function rowToUser(r: UserRow): StoredUser {
+  return { id: r.id, nickname: r.nickname, avatar: r.avatar, status: r.status, lastSeen: r.last_seen }
+}
+
+function rowToMessage(r: MessageRow, files: Map<string, StoredFile>, replies: Map<number, ReplyRef>): Message {
   let mentions: string[] = []
   try {
     const parsed: unknown = JSON.parse(r.mentions)
@@ -220,9 +301,21 @@ function rowToMessage(r: MessageRow, files: Map<string, StoredFile>): Message {
       .map((id) => files.get(id))
       .filter((f): f is StoredFile => Boolean(f))
       .map(publicFile),
+    replyTo: r.reply_to === null ? null : (replies.get(r.reply_to) ?? { id: r.reply_to, authorId: '', authorName: '', content: '', attachments: 0, deleted: true }),
     createdAt: r.created_at,
     editedAt: r.edited_at
   }
+}
+
+/** Превращает строку поиска в запрос FTS5: каждое слово — префикс, все слова обязательны. */
+function ftsQuery(raw: string): string | null {
+  const words = raw
+    .split(/\s+/u)
+    .map((w) => w.replace(/["*]/g, '').trim())
+    .filter((w) => w.length > 0)
+    .slice(0, 8)
+  if (words.length === 0) return null
+  return words.map((w) => `"${w}"*`).join(' ')
 }
 
 export class ZvonDb {
@@ -241,11 +334,19 @@ export class ZvonDb {
     const current = this.db.pragma('user_version', { simple: true }) as number
     for (let v = current; v < MIGRATIONS.length; v++) {
       this.log.info(`Применяю миграцию БД №${v + 1}`)
-      const run = this.db.transaction(() => {
-        this.db.exec(MIGRATIONS[v])
-        this.db.pragma(`user_version = ${v + 1}`)
-      })
-      run()
+      // Пятая миграция пересоздаёт таблицу каналов. Внешние ключи выключаем ЗАРАНЕЕ (внутри транзакции
+      // PRAGMA не действует): иначе DROP TABLE channels каскадом удалил бы все сообщения.
+      const rebuildChannels = v === 4
+      if (rebuildChannels) this.db.pragma('foreign_keys = OFF')
+      try {
+        this.db.transaction(() => {
+          this.db.exec(MIGRATIONS[v])
+          if (rebuildChannels) this.db.exec(CHANNELS_WITH_DM)
+          this.db.pragma(`user_version = ${v + 1}`)
+        })()
+      } finally {
+        if (rebuildChannels) this.db.pragma('foreign_keys = ON')
+      }
     }
   }
 
@@ -276,14 +377,71 @@ export class ZvonDb {
 
   /* ---------- каналы ---------- */
 
+  private rowToChannel(r: ChannelRow, members?: Map<string, string[]>): Channel {
+    const ch: Channel = { id: r.id, name: r.name, type: r.type, position: r.position }
+    if (r.type === 'dm') ch.members = members?.get(r.id) ?? this.channelMembers(r.id)
+    return ch
+  }
+
+  /** Общие каналы сервера (без личных). */
   listChannels(): Channel[] {
-    const rows = this.db.prepare('SELECT id, name, type, position FROM channels ORDER BY type, position, created_at').all() as ChannelRow[]
-    return rows.map((r) => ({ id: r.id, name: r.name, type: r.type, position: r.position }))
+    const rows = this.db
+      .prepare(`SELECT id, name, type, position FROM channels WHERE type != 'dm' ORDER BY type, position, created_at`)
+      .all() as ChannelRow[]
+    return rows.map((r) => this.rowToChannel(r))
+  }
+
+  /** Личные каналы участника. */
+  listDmChannels(userId: string): Channel[] {
+    const rows = this.db
+      .prepare(
+        `SELECT c.id, c.name, c.type, c.position FROM channels c
+         JOIN channel_members m ON m.channel_id = c.id WHERE c.type = 'dm' AND m.user_id = ? ORDER BY c.created_at`
+      )
+      .all(userId) as ChannelRow[]
+    return rows.map((r) => this.rowToChannel(r))
+  }
+
+  /** Все каналы, которые видит участник: общие плюс его личные. */
+  channelsFor(userId: string): Channel[] {
+    return [...this.listChannels(), ...this.listDmChannels(userId)]
   }
 
   getChannel(id: string): Channel | null {
     const r = this.db.prepare('SELECT id, name, type, position FROM channels WHERE id = ?').get(id) as ChannelRow | undefined
-    return r ? { id: r.id, name: r.name, type: r.type, position: r.position } : null
+    return r ? this.rowToChannel(r) : null
+  }
+
+  channelMembers(channelId: string): string[] {
+    return (this.db.prepare('SELECT user_id FROM channel_members WHERE channel_id = ?').all(channelId) as Array<{ user_id: string }>).map(
+      (r) => r.user_id
+    )
+  }
+
+  isChannelMember(channelId: string, userId: string): boolean {
+    return Boolean(this.db.prepare('SELECT 1 FROM channel_members WHERE channel_id = ? AND user_id = ?').get(channelId, userId))
+  }
+
+  /** Личный канал двух участников (создаётся при первом обращении). Возвращает канал и признак «только что создан». */
+  openDm(a: string, b: string): { channel: Channel; created: boolean } {
+    const existing = this.db
+      .prepare(
+        `SELECT c.id, c.name, c.type, c.position FROM channels c
+         WHERE c.type = 'dm'
+           AND EXISTS (SELECT 1 FROM channel_members WHERE channel_id = c.id AND user_id = ?)
+           AND EXISTS (SELECT 1 FROM channel_members WHERE channel_id = c.id AND user_id = ?)
+         LIMIT 1`
+      )
+      .get(a, b) as ChannelRow | undefined
+    if (existing) return { channel: this.rowToChannel(existing), created: false }
+    const id = randomUUID()
+    this.db.transaction(() => {
+      this.db.prepare(`INSERT INTO channels (id, name, type, position, created_at) VALUES (?, '', 'dm', 0, ?)`).run(id, Date.now())
+      const ins = this.db.prepare('INSERT INTO channel_members (channel_id, user_id) VALUES (?, ?)')
+      ins.run(id, a)
+      ins.run(id, b)
+    })()
+    return { channel: this.getChannel(id)!, created: true }
   }
 
   private nextPosition(type: ChannelType): number {
@@ -315,6 +473,7 @@ export class ZvonDb {
         this.db.prepare(`DELETE FROM files WHERE id IN (${ph})`).run(...files.map((f) => f.id))
       }
       this.db.prepare('DELETE FROM messages WHERE channel_id = ?').run(id)
+      this.db.prepare('DELETE FROM reads WHERE channel_id = ?').run(id)
       this.db.prepare('DELETE FROM channels WHERE id = ?').run(id)
       return files
     })
@@ -347,6 +506,21 @@ export class ZvonDb {
     this.db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, value)
   }
 
+  statusPresets(): string[] {
+    const raw = this.getSetting('statusPresets')
+    if (raw === null) return [...DEFAULT_STATUS_PRESETS]
+    try {
+      const v: unknown = JSON.parse(raw)
+      return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [...DEFAULT_STATUS_PRESETS]
+    } catch {
+      return [...DEFAULT_STATUS_PRESETS]
+    }
+  }
+
+  setStatusPresets(presets: string[]): void {
+    this.setSetting('statusPresets', JSON.stringify(presets))
+  }
+
   /* ---------- пользователи ---------- */
 
   upsertUser(id: string, nickname: string): StoredUser {
@@ -365,10 +539,12 @@ export class ZvonDb {
   }
 
   getUser(id: string): StoredUser | null {
-    const r = this.db.prepare('SELECT id, nickname, avatar, last_seen FROM users WHERE id = ?').get(id) as
-      | { id: string; nickname: string; avatar: string | null; last_seen: number }
-      | undefined
-    return r ? { id: r.id, nickname: r.nickname, avatar: r.avatar, lastSeen: r.last_seen } : null
+    const r = this.db.prepare('SELECT id, nickname, avatar, status, last_seen FROM users WHERE id = ?').get(id) as UserRow | undefined
+    return r ? rowToUser(r) : null
+  }
+
+  setUserStatus(id: string, status: string | null): void {
+    this.db.prepare('UPDATE users SET status = ? WHERE id = ?').run(status, id)
   }
 
   /**
@@ -377,10 +553,8 @@ export class ZvonDb {
    */
   listUsers(limit = 200, accountsOnly = false): StoredUser[] {
     const where = accountsOnly ? 'WHERE id IN (SELECT id FROM accounts)' : ''
-    const rows = this.db
-      .prepare(`SELECT id, nickname, avatar, last_seen FROM users ${where} ORDER BY last_seen DESC LIMIT ?`)
-      .all(limit) as Array<{ id: string; nickname: string; avatar: string | null; last_seen: number }>
-    return rows.map((r) => ({ id: r.id, nickname: r.nickname, avatar: r.avatar, lastSeen: r.last_seen }))
+    const rows = this.db.prepare(`SELECT id, nickname, avatar, status, last_seen FROM users ${where} ORDER BY last_seen DESC LIMIT ?`).all(limit) as UserRow[]
+    return rows.map(rowToUser)
   }
 
   /** Ник занят другим пользователем (без учёта регистра; lower() в SQLite не знает кириллицу — сравниваем в JS). */
@@ -389,6 +563,66 @@ export class ZvonDb {
     const wanted = nickname.toLocaleLowerCase()
     const rows = this.db.prepare(`SELECT nickname FROM users WHERE id != ? ${where}`).all(exceptId) as Array<{ nickname: string }>
     return rows.some((r) => r.nickname.toLocaleLowerCase() === wanted)
+  }
+
+  /* ---------- роли ---------- */
+
+  listRoles(): Role[] {
+    const rows = this.db.prepare('SELECT id, name, color, position FROM roles ORDER BY position, created_at').all() as Role[]
+    return rows.map((r) => ({ id: r.id, name: r.name, color: r.color, position: r.position }))
+  }
+
+  getRole(id: string): Role | null {
+    const r = this.db.prepare('SELECT id, name, color, position FROM roles WHERE id = ?').get(id) as Role | undefined
+    return r ? { id: r.id, name: r.name, color: r.color, position: r.position } : null
+  }
+
+  createRole(name: string, color: string): Role {
+    const id = randomUUID()
+    const pos = (this.db.prepare('SELECT COALESCE(MAX(position), -1) AS p FROM roles').get() as { p: number }).p + 1
+    this.db.prepare('INSERT INTO roles (id, name, color, position, created_at) VALUES (?, ?, ?, ?, ?)').run(id, name, color, pos, Date.now())
+    return this.getRole(id)!
+  }
+
+  updateRole(id: string, patch: { name?: string; color?: string }): Role | null {
+    if (patch.name !== undefined) this.db.prepare('UPDATE roles SET name = ? WHERE id = ?').run(patch.name, id)
+    if (patch.color !== undefined) this.db.prepare('UPDATE roles SET color = ? WHERE id = ?').run(patch.color, id)
+    return this.getRole(id)
+  }
+
+  /** Удаляет роль; возвращает участников, у которых она была (чтобы разослать обновления). */
+  deleteRole(id: string): string[] {
+    const users = (this.db.prepare('SELECT user_id FROM user_roles WHERE role_id = ?').all(id) as Array<{ user_id: string }>).map((r) => r.user_id)
+    this.db.prepare('DELETE FROM roles WHERE id = ?').run(id)
+    return users
+  }
+
+  assignRole(userId: string, roleId: string, assigned: boolean): void {
+    if (assigned) this.db.prepare('INSERT OR IGNORE INTO user_roles (user_id, role_id) VALUES (?, ?)').run(userId, roleId)
+    else this.db.prepare('DELETE FROM user_roles WHERE user_id = ? AND role_id = ?').run(userId, roleId)
+  }
+
+  /** Роли участника в порядке ролей сервера. */
+  rolesOf(userId: string): string[] {
+    return (
+      this.db
+        .prepare('SELECT ur.role_id FROM user_roles ur JOIN roles r ON r.id = ur.role_id WHERE ur.user_id = ? ORDER BY r.position, r.created_at')
+        .all(userId) as Array<{ role_id: string }>
+    ).map((r) => r.role_id)
+  }
+
+  /** Роли всех участников одним запросом: userId → id ролей. */
+  rolesOfAll(): Map<string, string[]> {
+    const rows = this.db
+      .prepare('SELECT ur.user_id, ur.role_id FROM user_roles ur JOIN roles r ON r.id = ur.role_id ORDER BY r.position, r.created_at')
+      .all() as Array<{ user_id: string; role_id: string }>
+    const map = new Map<string, string[]>()
+    for (const r of rows) {
+      const list = map.get(r.user_id) ?? []
+      list.push(r.role_id)
+      map.set(r.user_id, list)
+    }
+    return map
   }
 
   /* ---------- аккаунты ---------- */
@@ -433,12 +667,16 @@ export class ZvonDb {
 
   /** Удаляет аккаунт; сообщения и профиль остаются (в истории видно имя автора). */
   deleteAccount(id: string): void {
-    this.db.prepare('DELETE FROM accounts WHERE id = ?').run(id)
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM accounts WHERE id = ?').run(id)
+      this.db.prepare('DELETE FROM user_roles WHERE user_id = ?').run(id)
+      this.db.prepare('DELETE FROM push_subscriptions WHERE user_id = ?').run(id)
+    })()
   }
 
   /* ---------- сообщения ---------- */
 
-  /** Подтягивает вложения для пачки сообщений одним запросом. */
+  /** Подтягивает вложения и цитаты для пачки сообщений несколькими запросами. */
   private toMessages(rows: MessageRow[]): Message[] {
     const ids = [...new Set(rows.flatMap((r) => parseIds(r.attachments)))]
     const files = new Map<string, StoredFile>()
@@ -447,17 +685,39 @@ export class ZvonDb {
       const fileRows = this.db.prepare(`SELECT * FROM files WHERE id IN (${placeholders})`).all(...ids) as FileRow[]
       for (const f of fileRows) files.set(f.id, rowToFile(f))
     }
-    return rows.map((r) => rowToMessage(r, files))
+    const replyIds = [...new Set(rows.map((r) => r.reply_to).filter((x): x is number => x !== null))]
+    const replies = new Map<number, ReplyRef>()
+    if (replyIds.length > 0) {
+      const ph = replyIds.map(() => '?').join(',')
+      const refs = this.db
+        .prepare(`SELECT id, author_id, author_name, content, attachments FROM messages WHERE id IN (${ph})`)
+        .all(...replyIds) as Array<Pick<MessageRow, 'id' | 'author_id' | 'author_name' | 'content' | 'attachments'>>
+      for (const r of refs) {
+        const text = r.content.replace(/\s+/gu, ' ').trim()
+        replies.set(r.id, {
+          id: r.id,
+          authorId: r.author_id,
+          authorName: r.author_name,
+          content: text.length > LIMITS.replySnippetLength ? `${text.slice(0, LIMITS.replySnippetLength)}…` : text,
+          attachments: parseIds(r.attachments).length,
+          deleted: false
+        })
+      }
+    }
+    return rows.map((r) => rowToMessage(r, files, replies))
   }
 
   /** Сохраняет сообщение и привязывает к нему вложения (только свои и ещё не привязанные). */
-  insertMessage(m: Omit<Message, 'id' | 'editedAt' | 'nonce' | 'attachments'>, attachmentIds: string[]): Message {
+  insertMessage(
+    m: Omit<Message, 'id' | 'editedAt' | 'nonce' | 'attachments' | 'replyTo'> & { replyTo: number | null },
+    attachmentIds: string[]
+  ): Message {
     const run = this.db.transaction(() => {
       const info = this.db
         .prepare(
-          'INSERT INTO messages (channel_id, author_id, author_name, content, mentions, created_at, attachments) VALUES (?, ?, ?, ?, ?, ?, ?)'
+          'INSERT INTO messages (channel_id, author_id, author_name, content, mentions, created_at, attachments, reply_to) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
         )
-        .run(m.channelId, m.authorId, m.authorName, m.content, JSON.stringify(m.mentions), m.createdAt, JSON.stringify(attachmentIds))
+        .run(m.channelId, m.authorId, m.authorName, m.content, JSON.stringify(m.mentions), m.createdAt, JSON.stringify(attachmentIds), m.replyTo)
       const id = Number(info.lastInsertRowid)
       if (attachmentIds.length > 0) {
         const placeholders = attachmentIds.map(() => '?').join(',')
@@ -513,6 +773,101 @@ export class ZvonDb {
     const hasMore = rows.length > limit
     const page = rows.slice(0, limit).reverse()
     return { messages: this.toMessages(page), hasMore }
+  }
+
+  /** Полнотекстовый поиск в указанных каналах, от новых к старым. */
+  search(query: string, channelIds: string[], before: number | undefined, limit: number): { messages: Message[]; hasMore: boolean } {
+    const match = ftsQuery(query)
+    if (!match || channelIds.length === 0) return { messages: [], hasMore: false }
+    const ph = channelIds.map(() => '?').join(',')
+    let rows: MessageRow[]
+    try {
+      rows = this.db
+        .prepare(
+          `SELECT m.* FROM messages_fts f JOIN messages m ON m.id = f.rowid
+           WHERE messages_fts MATCH ? AND m.channel_id IN (${ph}) AND m.id < ? ORDER BY m.id DESC LIMIT ?`
+        )
+        .all(match, ...channelIds, before ?? Number.MAX_SAFE_INTEGER, limit + 1) as MessageRow[]
+    } catch (err) {
+      // Странный запрос, который FTS не разобрал, — считаем, что ничего не нашлось.
+      this.log.warn('Поиск не удался', err)
+      return { messages: [], hasMore: false }
+    }
+    return { messages: this.toMessages(rows.slice(0, limit)), hasMore: rows.length > limit }
+  }
+
+  /* ---------- прочитанное ---------- */
+
+  lastReadId(userId: string, channelId: string): number {
+    const r = this.db.prepare('SELECT last_read_id FROM reads WHERE user_id = ? AND channel_id = ?').get(userId, channelId) as
+      | { last_read_id: number }
+      | undefined
+    return r?.last_read_id ?? 0
+  }
+
+  /** Отмечает прочитанным до messageId (только вперёд). Возвращает новое значение. */
+  markRead(userId: string, channelId: string, messageId: number): number {
+    this.db
+      .prepare(
+        `INSERT INTO reads (user_id, channel_id, last_read_id) VALUES (?, ?, ?)
+         ON CONFLICT(user_id, channel_id) DO UPDATE SET last_read_id = MAX(last_read_id, excluded.last_read_id)`
+      )
+      .run(userId, channelId, messageId)
+    return this.lastReadId(userId, channelId)
+  }
+
+  /**
+   * Непрочитанное участника по каналам (без своих сообщений). В личных каналах каждое сообщение
+   * считается важным, как упоминание.
+   */
+  unreadFor(userId: string, channels: Channel[]): Record<string, UnreadInfo> {
+    const result: Record<string, UnreadInfo> = {}
+    const stmt = this.db.prepare(
+      `SELECT COUNT(*) AS n, MIN(id) AS first,
+              SUM(CASE WHEN mentions LIKE ? OR mentions LIKE '%"everyone"%' OR reply_to IN (SELECT id FROM messages WHERE author_id = ?) THEN 1 ELSE 0 END) AS mentions
+       FROM messages WHERE channel_id = ? AND id > ? AND author_id != ?`
+    )
+    const mentionLike = `%"${userId.replace(/[%_]/g, '')}"%`
+    for (const ch of channels) {
+      if (ch.type === 'voice') continue
+      const lastReadId = this.lastReadId(userId, ch.id)
+      const r = stmt.get(mentionLike, userId, ch.id, lastReadId, userId) as { n: number; first: number | null; mentions: number | null }
+      if (!r.n) continue
+      result[ch.id] = {
+        lastReadId,
+        count: r.n,
+        mentions: ch.type === 'dm' ? r.n : (r.mentions ?? 0),
+        firstUnreadId: r.first
+      }
+    }
+    return result
+  }
+
+  /* ---------- push-подписки ---------- */
+
+  addPushSubscription(userId: string, sub: PushSubscriptionJson): void {
+    this.db
+      .prepare(
+        `INSERT INTO push_subscriptions (endpoint, user_id, p256dh, auth, created_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth`
+      )
+      .run(sub.endpoint, userId, sub.keys.p256dh, sub.keys.auth, Date.now())
+  }
+
+  removePushSubscription(endpoint: string): void {
+    this.db.prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(endpoint)
+  }
+
+  pushSubscriptionsOf(userIds: string[]): Array<{ userId: string; subscription: PushSubscriptionJson }> {
+    if (userIds.length === 0) return []
+    const ph = userIds.map(() => '?').join(',')
+    const rows = this.db.prepare(`SELECT endpoint, user_id, p256dh, auth FROM push_subscriptions WHERE user_id IN (${ph})`).all(...userIds) as Array<{
+      endpoint: string
+      user_id: string
+      p256dh: string
+      auth: string
+    }>
+    return rows.map((r) => ({ userId: r.user_id, subscription: { endpoint: r.endpoint, keys: { p256dh: r.p256dh, auth: r.auth } } }))
   }
 
   /* ---------- файлы ---------- */
