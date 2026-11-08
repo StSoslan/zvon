@@ -350,6 +350,8 @@ let overlaidAt = 0
 let lastGestureAt = 0
 /** После остановки видео первое же нажатие заново запускает звук звонка — даже если он выглядит исправным. */
 let recoverOnGesture = false
+/** Одно касание приходит тремя событиями (pointerdown, touchend, click) — чиним звонок не чаще раза в полсекунды. */
+let lastRecoverAt = 0
 
 let pageMediaCount = 0
 let recoverTimer: ReturnType<typeof setTimeout> | null = null
@@ -432,6 +434,8 @@ function onUserGesture(): void {
   lastGestureAt = Date.now()
   if (!engine?.inChannel || !callMayPlay()) return
   if (!recoverOnGesture && !engine.playbackStalled && !engine.micInterrupted) return
+  if (lastGestureAt - lastRecoverAt < 500) return
+  lastRecoverAt = lastGestureAt
   recoverOnGesture = false
   micRecoveries = 0
   void engine.recoverAudio()
@@ -455,7 +459,8 @@ function scheduleMicRecovery(delayMs: number): void {
     // Страница скрыта или звук сейчас у видео — вернём микрофон, когда страницу откроют или видео остановится.
     if (document.visibilityState !== 'visible' || !callMayPlay()) return
     micRecoveries++
-    void engine.recoverAudio()
+    diag(`переоткрываю приглушённый микрофон (попытка ${micRecoveries})`)
+    void engine.restartMic('auto')
   }, delayMs)
 }
 

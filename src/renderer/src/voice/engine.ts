@@ -408,6 +408,7 @@ export class VoiceEngine {
     const track = stream.getAudioTracks()[0]
     if (!track) throw new Error('Микрофон не выдал аудиодорожку')
     this.watchMic(track)
+    this.micOpenedAt = Date.now()
     const info = track.getSettings()
     diag(`микрофон открыт: ${info.sampleRate ?? '?'} Гц, шумоподавление «${effectiveNoiseMode(this.settings())}»`)
     if (!ai) return track
@@ -421,7 +422,7 @@ export class VoiceEngine {
       this.denoise = denoise
       // Обработанная дорожка сама не узнаёт, что микрофон отключили, — следим за исходной.
       track.addEventListener('ended', () => {
-        if (this.denoise === denoise) void this.restartMic()
+        if (this.denoise === denoise) void this.restartMic('auto')
       })
       diag(denoise.engine === 'dfn' ? 'шумоподавление: нейросеть DeepFilterNet работает' : 'шумоподавление: нейросеть не загрузилась, упрощённый режим (RNNoise)')
       if (denoise.engine !== 'dfn') this.micNotice = DENOISE_NOTICE.load
@@ -451,6 +452,11 @@ export class VoiceEngine {
     track.addEventListener('mute', report)
     track.addEventListener('unmute', report)
   }
+
+  /** Когда открыт текущий микрофон: трек, умерший сразу после открытия, — признак того, что система его не отдаёт. */
+  private micOpenedAt = 0
+  /** Сколько раз подряд микрофон погас, не прожив и трёх секунд. */
+  private micQuickFailures = 0
 
   /** Микрофон открыт, но система его приглушила или остановила. */
   get micInterrupted(): boolean {
@@ -491,7 +497,7 @@ export class VoiceEngine {
       if (!transmit) this.mic.pause()
       this.mic.on('trackended', () => {
         console.warn('[voice] микрофон отключён, пробую переоткрыть')
-        void this.restartMic()
+        void this.restartMic('auto')
       })
       this.hooks.onMicError(this.micNotice)
       this.micNotice = null
@@ -505,10 +511,22 @@ export class VoiceEngine {
   /** Очередь переоткрытий: два одновременных открытия микрофона мешают друг другу. */
   private micQueue: Promise<void> = Promise.resolve()
 
-  /** Переоткрывает микрофон (смена устройства или обработки звука, восстановление после сбоя). */
-  restartMic(): Promise<void> {
-    // Переоткрытие уже ждёт своей очереди — второе подряд не нужно.
+  /**
+   * Переоткрывает микрофон (смена устройства или обработки звука, восстановление после сбоя).
+   * reason 'auto' — само приложение заметило, что микрофон погас: после трёх быстрых неудач подряд
+   * такие попытки прекращаются, пока человек не нажмёт на экран или не сменит настройку ('user'),
+   * иначе телефон, у которого микрофон занят, дёргался бы каждую секунду.
+   */
+  restartMic(reason: 'auto' | 'user' = 'user'): Promise<void> {
+    if (reason === 'user') this.micQuickFailures = 0
+    // Переоткрытие уже ждёт своей очереди — второе подряд не нужно (один сбой приходит двумя событиями).
     if (this.micRestartQueued) return this.micQueue
+    if (reason === 'auto') {
+      if (this.micOpenedAt && Date.now() - this.micOpenedAt < 3000) {
+        if (++this.micQuickFailures === 3) diag('микрофон гаснет сразу после открытия — больше не пробую сам, жду нажатия')
+        if (this.micQuickFailures >= 3) return this.micQueue
+      } else this.micQuickFailures = 0
+    }
     this.micRestartQueued = true
     this.micQueue = this.micQueue.then(() => {
       this.micRestartQueued = false
@@ -519,7 +537,7 @@ export class VoiceEngine {
 
   private micRestartQueued = false
 
-  private async doRestartMic(): Promise<void> {
+  private async doRestartMic(attempt = 0): Promise<void> {
     if (!this.inChannel || !this.ready) return
     const gen = this.gen
     if (!this.mic) {
@@ -532,13 +550,22 @@ export class VoiceEngine {
         track.stop()
         return
       }
+      if (track.readyState === 'ended') throw Object.assign(new Error('track ended'), { name: 'InvalidStateError' })
       track.enabled = this.shouldTransmit()
       await this.mic.replaceTrack({ track })
       this.hooks.onMicError(this.micNotice)
       this.micNotice = null
     } catch (err) {
       diag(`микрофон не переоткрылся: ${errText(err)}`)
-      if (gen === this.gen) this.hooks.onMicError(mediaErrorText(err, 'микрофон'))
+      if (gen !== this.gen) return
+      // Микрофон открылся и тут же остановился: система ещё не отдала его. Пробуем ещё пару раз, не чаще раза в секунду.
+      if ((err as DOMException).name === 'InvalidStateError' && attempt < 2 && this.micQuickFailures < 3) {
+        this.micQuickFailures++
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+        if (gen === this.gen) await this.doRestartMic(attempt + 1)
+        return
+      }
+      this.hooks.onMicError(mediaErrorText(err, 'микрофон'))
     }
   }
 
@@ -980,22 +1007,16 @@ export class VoiceEngine {
     for (const r of this.remotes.values()) {
       if (r.consumer.closed) continue
       this.dropBoost(r)
-      const old = r.el
+      // Элемент остаётся тот же (новые копились бы в браузере), но поток подключается заново —
+      // это заставляет браузер заново собрать вывод звука.
       try {
-        old.pause()
-        old.srcObject = null
+        r.el.pause()
+        r.el.srcObject = new MediaStream([r.consumer.track])
       } catch {
         /* ignore */
       }
-      const el = new Audio() as SinkableAudio
-      el.autoplay = true
-      el.setAttribute('playsinline', '')
-      el.srcObject = new MediaStream([r.consumer.track])
-      const sink = this.settings().outputDeviceId
-      if (sink && el.setSinkId) el.setSinkId(sink).catch(() => undefined)
-      r.el = el
       this.applyVolume(r)
-      this.play(el)
+      this.play(r.el)
     }
     if (this.boostCtx && this.boostCtx.state !== 'running' && this.boostCtx.state !== 'closed') {
       await this.boostCtx.resume().catch(() => undefined)
