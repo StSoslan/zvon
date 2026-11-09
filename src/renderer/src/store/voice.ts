@@ -389,6 +389,18 @@ function callMayPlay(): boolean {
   return !pageMediaPlaying() || (IS_IOS && !overlayBlocked)
 }
 
+/*
+ * Звонок и другие приложения на iPhone. Safari не умеет делить звук с другими приложениями: звук телефона
+ * достаётся либо звонку, либо, например, видео в TikTok. Если Safari свёрнут и звук у звонка забрали,
+ * мы его не отбираем обратно (иначе видео в другом приложении не играет): звонок молчит и возвращается,
+ * когда телефон сам отдаёт звук (видео закончилось) или когда человек снова открывает страницу.
+ */
+function yieldingToOtherApp(): boolean {
+  return IS_IOS && document.visibilityState !== 'visible'
+}
+/** Чтобы запись об уступке попадала в журнал один раз за сворачивание. */
+let yieldLogged = false
+
 function resumeCallAudio(): void {
   if (!engine || !callMayPlay()) return
   engine.resumePlayback()
@@ -439,6 +451,8 @@ export function notifyPageMedia(playing: boolean, el?: HTMLMediaElement): void {
   recoverTimer = setTimeout(() => {
     recoverTimer = null
     if (pageMediaCount > 0 || !engine?.inChannel) return
+    // Видео остановилось, потому что Safari свернули, — звонок починится при возврате на страницу.
+    if (yieldingToOtherApp()) return
     micRecoveries = 0
     recoverOnGesture = IS_IOS
     void engine.recoverAudio()
@@ -500,7 +514,7 @@ function onMicInterrupted(interrupted: boolean): void {
  */
 function initPlaybackGuard(): void {
   const onMediaStop = (e: Event): void => {
-    if (e.target instanceof HTMLMediaElement) setTimeout(resumeCallAudio, 300)
+    if (e.target instanceof HTMLMediaElement) setTimeout(() => !yieldingToOtherApp() && resumeCallAudio(), 300)
   }
   document.addEventListener('pause', onMediaStop, true)
   document.addEventListener('ended', onMediaStop, true)
@@ -509,6 +523,13 @@ function initPlaybackGuard(): void {
     document.addEventListener(type, onUserGesture, { capture: true, passive: true })
   }
   setInterval(() => {
+    if (yieldingToOtherApp()) {
+      if (!yieldLogged && engine?.inChannel && (engine.playbackStalled || engine.micInterrupted)) {
+        yieldLogged = true
+        diag('Safari свёрнут, звук забрало другое приложение — звонок молчит и ждёт')
+      }
+      return
+    }
     if (engine?.playbackStalled) resumeCallAudio()
     if (engine?.micInterrupted) scheduleMicRecovery(0)
   }, 2000)
@@ -533,6 +554,7 @@ export async function initVoiceGlobal(): Promise<void> {
     engine?.setPageVisible(document.visibilityState === 'visible')
     if (engine?.inChannel) diag(`страница ${document.visibilityState === 'visible' ? 'снова открыта' : 'скрыта'}`)
     if (document.visibilityState === 'visible') {
+      yieldLogged = false
       resumeCallAudio()
       // Вернулись в браузер (после звонка по телефону, другого приложения) — микрофон мог остаться приглушённым.
       micRecoveries = 0

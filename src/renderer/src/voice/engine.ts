@@ -563,6 +563,12 @@ export class VoiceEngine {
     // Переоткрытие уже ждёт своей очереди — второе подряд не нужно (один сбой приходит двумя событиями).
     if (this.micRestartQueued) return this.micQueue
     if (reason === 'auto') {
+      // Safari свёрнут: микрофон забрало другое приложение (видео, звонок). Не отбираем его обратно —
+      // вернём, когда человек снова откроет страницу (см. visibilitychange в store/voice.ts).
+      if (IOS && !this.pageVisible) {
+        diag('микрофон погас, пока Safari свёрнут — верну его, когда страницу откроют')
+        return this.micQueue
+      }
       if (this.micOpenedAt && Date.now() - this.micOpenedAt < 3000) {
         if (++this.micQuickFailures === 3) diag('микрофон гаснет сразу после открытия — больше не пробую сам, жду нажатия')
         if (this.micQuickFailures >= 3) return this.micQueue
